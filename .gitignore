@@ -1,0 +1,6 @@
+/.venv/
+/build/
+/dist/
+/debug.log
+/debug_timing.jsonl
+/translate_via_phone.spec
