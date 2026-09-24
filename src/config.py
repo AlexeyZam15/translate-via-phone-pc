@@ -23,7 +23,9 @@ FPS = 10
 JPEG_QUALITY = 60
 MAX_STREAM_WIDTH = 960
 
-FIRST_FRAME_TIMEOUT = 10
+# Увеличено с 10 до 30 секунд: даём пользователю время переключиться
+# на подходящее окно после старта трансляции.
+FIRST_FRAME_TIMEOUT = 30
 
 # --- Оверлей ---
 OVERLAY_POLL_MS = 500

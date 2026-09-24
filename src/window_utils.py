@@ -8,6 +8,8 @@ import win32api
 import win32con
 import win32process
 
+from src.debug_logger import logger as dbg
+
 try:
     import psutil
 except ImportError:
@@ -16,12 +18,14 @@ except ImportError:
 # Заголовки, которые нужно исключить (наши окна)
 EXCLUDED_TITLES = {
     "Simple Phone Translator",
+    "Translate via Phone",
     "Перевод",
     "Окно перевода",
     "Мини-бар",
     "Tk",
 }
 
+# Классы окон, которые нельзя захватывать (рабочий стол, панель задач, консоли)
 EXCLUDED_CLASSES = {
     "Progman",
     "WorkerW",
@@ -29,6 +33,23 @@ EXCLUDED_CLASSES = {
     "SysListView32",
     "TaskManagerWindow",
     "MultitaskingViewFrame",
+    # Консольные окна
+    "ConsoleWindowClass",  # cmd.exe, PowerShell (классическая консоль)
+    "PseudoConsoleWindow",  # Windows Terminal (новый)
+    "CASCADIA_HOSTING_WINDOW_CLASS",  # Windows Terminal
+}
+
+# Процессы, окна которых нельзя захватывать (консоли и интерпретаторы)
+EXCLUDED_PROCESSES = {
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "conhost.exe",
+    "windowsterminal.exe",
+    "openconsole.exe",
+    "wt.exe",
+    "python.exe",
+    "pythonw.exe",
 }
 
 # Кэш имён процессов (pid -> name)
@@ -38,12 +59,6 @@ _process_name_cache = {}
 def get_process_name_by_hwnd(hwnd: int, default: str = "?") -> str:
     """
     Возвращает имя процесса (exe) по HWND.
-    Пробует несколько способов:
-      1. psutil (если установлен)
-      2. QueryFullProcessImageNameW (Win32 API)
-      3. GetModuleFileNameEx (Win32 API)
-      4. Toolhelp32Snapshot (Win32 API)
-      5. Возвращает default
     """
     if not hwnd or not win32gui.IsWindow(hwnd):
         return default
@@ -55,13 +70,11 @@ def get_process_name_by_hwnd(hwnd: int, default: str = "?") -> str:
     except Exception:
         return default
 
-    # Проверяем кэш
     if pid in _process_name_cache:
         return _process_name_cache[pid]
 
     name = _get_process_name_by_pid(pid)
 
-    # Кэшируем
     if name != default:
         _process_name_cache[pid] = name
 
@@ -71,7 +84,6 @@ def get_process_name_by_hwnd(hwnd: int, default: str = "?") -> str:
 def _get_process_name_by_pid(pid: int) -> str:
     """Возвращает имя процесса по PID, используя несколько способов."""
 
-    # === Способ 1: psutil ===
     if psutil is not None:
         try:
             proc = psutil.Process(pid)
@@ -79,7 +91,6 @@ def _get_process_name_by_pid(pid: int) -> str:
         except Exception:
             pass
 
-    # === Способ 2: QueryFullProcessImageNameW ===
     try:
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         process_handle = win32api.OpenProcess(
@@ -99,7 +110,6 @@ def _get_process_name_by_pid(pid: int) -> str:
     except Exception:
         pass
 
-    # === Способ 3: GetModuleFileNameEx ===
     try:
         PROCESS_QUERY_INFORMATION = 0x0400
         PROCESS_VM_READ = 0x0010
@@ -116,7 +126,6 @@ def _get_process_name_by_pid(pid: int) -> str:
     except Exception:
         pass
 
-    # === Способ 4: Toolhelp32Snapshot ===
     try:
         TH32CS_SNAPPROCESS = 0x00000002
         snapshot = win32api.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -135,48 +144,133 @@ def _get_process_name_by_pid(pid: int) -> str:
     return "?"
 
 
+def _check_window(hwnd: int, our_hwnds):
+    """
+    Проверяет, подходит ли окно для захвата.
+    Возвращает (ok: bool, reason: str).
+    reason — причина отказа (пустая строка, если ok).
+    """
+    if not hwnd:
+        return False, "hwnd=0"
+
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return False, "not a window"
+    except Exception as e:
+        return False, f"IsWindow error: {e}"
+
+    if our_hwnds and hwnd in our_hwnds:
+        return False, "our own window"
+
+    try:
+        if not win32gui.IsWindowVisible(hwnd):
+            return False, "not visible"
+    except Exception:
+        return False, "IsWindowVisible error"
+
+    try:
+        if win32gui.IsIconic(hwnd):
+            return False, "minimized"
+    except Exception:
+        return False, "IsIconic error"
+
+    try:
+        title = win32gui.GetWindowText(hwnd)
+    except Exception:
+        return False, "GetWindowText error"
+
+    if not title or len(title) < 1:
+        return False, "no title"
+
+    if title in EXCLUDED_TITLES:
+        return False, f"excluded title: {title!r}"
+
+    try:
+        class_name = win32gui.GetClassName(hwnd)
+    except Exception:
+        return False, "GetClassName error"
+
+    if class_name in EXCLUDED_CLASSES:
+        return False, f"excluded class: {class_name!r}"
+
+    # Проверяем процесс — исключаем консоли и интерпретаторы
+    try:
+        process = get_process_name_by_hwnd(hwnd, default="?")
+        if process.lower() in EXCLUDED_PROCESSES:
+            return False, f"excluded process: {process!r}"
+    except Exception:
+        pass
+
+    try:
+        rect = win32gui.GetWindowRect(hwnd)
+        width = rect[2] - rect[0]
+        height = rect[3] - rect[1]
+    except Exception:
+        return False, "GetWindowRect error"
+
+    if width < 50 or height < 50:
+        return False, f"too small: {width}x{height}"
+
+    return True, ""
+
+
+def get_foreground_window(our_hwnds=None):
+    """
+    Возвращает HWND активного (foreground) окна, если оно подходит
+    для захвата. Иначе — None. Логирует причину отказа.
+
+    Args:
+        our_hwnds: список HWND наших окон (главное окно, оверлей),
+                   которые нельзя захватывать.
+
+    Returns:
+        HWND или None.
+    """
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+    except Exception as e:
+        dbg.log_event("pc.foreground_error", {"error": str(e)})
+        return None
+
+    if not hwnd:
+        return None
+
+    ok, reason = _check_window(hwnd, our_hwnds)
+    if not ok:
+        # Логируем причину только если окно не наше (не спамим на своих)
+        try:
+            title = win32gui.GetWindowText(hwnd)
+        except Exception:
+            title = "?"
+        dbg.log_event("pc.foreground_rejected", {
+            "hwnd": hwnd,
+            "title": title,
+            "reason": reason,
+        })
+        return None
+
+    return hwnd
+
+
 def get_active_windows(our_hwnd: int = None):
     """
     Возвращает список видимых окон с заголовками.
-
-    Args:
-        our_hwnd: HWND нашего главного окна (исключается из списка).
-
-    Returns:
-        list[dict]: [{'hwnd': int, 'title': str, 'process': str, 'width': int, 'height': int}, ...]
+    Оставлена для совместимости (может использоваться в отладке).
     """
     windows = []
+    our = [our_hwnd] if our_hwnd else None
 
     def enum_callback(hwnd, _):
         try:
-            if not win32gui.IsWindowVisible(hwnd):
-                return True
-            if hwnd == our_hwnd:
+            ok, _reason = _check_window(hwnd, our)
+            if not ok:
                 return True
 
             title = win32gui.GetWindowText(hwnd)
-            if not title or len(title) < 1:
-                return True
-            if title in EXCLUDED_TITLES:
-                return True
-
-            class_name = win32gui.GetClassName(hwnd)
-            if class_name in EXCLUDED_CLASSES:
-                return True
-
             rect = win32gui.GetWindowRect(hwnd)
             width = rect[2] - rect[0]
             height = rect[3] - rect[1]
-            if width < 50 or height < 50:
-                return True
-
             process = get_process_name_by_hwnd(hwnd, default="?")
-
-            # Исключаем свои окна по имени процесса
-            if process.lower() in ("python.exe", "pythonw.exe"):
-                # Но не исключаем, если пользователь хочет захватить python-скрипт
-                # (это может быть нужное окно)
-                pass
 
             windows.append({
                 'hwnd': hwnd,

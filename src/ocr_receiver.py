@@ -87,6 +87,7 @@ class OcrReceiver:
                     blocks = data.get('blocks', [])
                     fw = int(data.get('frame_width', 0))
                     fh = int(data.get('frame_height', 0))
+                    # ИЗМЕНЕНО: поддерживаем режим "ocr" (сырой OCR без перевода).
                     mode = data.get('mode', 'translate')
                     alpha = int(data.get('overlay_alpha', 217))
                     ts = time.time()

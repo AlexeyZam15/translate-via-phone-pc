@@ -1,5 +1,14 @@
 # src/simple_gui.py
-"""Упрощённый GUI translate_via_phone."""
+"""Упрощённый GUI translate_via_phone.
+
+Трансляция всегда идёт с активного (foreground) окна Windows.
+Диалог выбора окна убран. При смене активного окна трансляция
+переключается автоматически без перезапуска потоков.
+
+Если на момент старта нет подходящего активного окна — стример
+запускается в режиме ожидания и подхватывает окно, как только оно
+появится.
+"""
 
 import time
 import threading
@@ -10,7 +19,6 @@ from src.pc_streamer import WindowStreamer
 from src.ocr_receiver import OcrReceiver, DebugReceiver
 from src.ocr_overlay import OcrOverlayWindow
 from src import adb_utils
-from src import window_utils
 from src.debug_logger import logger as dbg
 
 
@@ -25,8 +33,6 @@ class SimplePhoneTranslator:
         self.adb_ready = False
 
         self.selected_device = None
-        self.selected_hwnd = None
-        self.selected_window_title = None
 
         self.pc_streamer = None
         self.ocr_receiver = None
@@ -34,9 +40,6 @@ class SimplePhoneTranslator:
         self.ocr_overlay = None
 
         self._help_window = None
-        self._window_select_dialog = None
-
-        self._on_window_selected_callback = None
 
         self._auto_refresh_timer = None
         self._auto_refresh_interval_ms = 3000
@@ -82,7 +85,7 @@ class SimplePhoneTranslator:
         self.refresh_btn.pack(side=tk.RIGHT, padx=(10, 0))
 
         self.window_status = tk.Label(
-            status_frame, text="🪟 Окно: будет выбрано при старте", font=("Arial", 10)
+            status_frame, text="🪟 Окно: активное (авто)", font=("Arial", 10)
         )
         self.window_status.pack(anchor=tk.W, pady=(5, 0))
 
@@ -129,179 +132,6 @@ class SimplePhoneTranslator:
         )
         self.log_text.pack(fill=tk.BOTH, expand=True)
         self.log_text.config(state=tk.DISABLED)
-
-    # ============================================================
-    # ДИАЛОГ ВЫБОРА ОКНА
-    # ============================================================
-
-    def _show_window_selection_dialog(self, on_selected_callback):
-        if self._window_select_dialog is not None:
-            try:
-                if self._window_select_dialog.winfo_exists():
-                    self._window_select_dialog.lift()
-                    self._window_select_dialog.focus_force()
-                    return
-            except Exception:
-                self._window_select_dialog = None
-
-        self._on_window_selected_callback = on_selected_callback
-
-        try:
-            our_hwnd = int(self.root.winfo_id())
-        except Exception:
-            our_hwnd = None
-
-        windows = window_utils.get_active_windows(our_hwnd=our_hwnd)
-
-        if not windows:
-            self.log("⚠️ Не найдено окон для захвата")
-            self._on_window_selected_callback = None
-            return
-
-        dialog = tk.Toplevel(self.root)
-        self._window_select_dialog = dialog
-        dialog.title("Выбор окна для трансляции")
-        dialog.geometry("750x550")
-        dialog.minsize(600, 400)
-        dialog.configure(bg="#1e1e1e")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        header = tk.Label(
-            dialog,
-            text="🖥️ Выберите окно для трансляции",
-            font=("Arial", 14, "bold"),
-            bg="#1e1e1e",
-            fg="#4CAF50"
-        )
-        header.pack(pady=(15, 5))
-
-        hint = tk.Label(
-            dialog,
-            text="Двойной клик — выбрать. Приложение и заголовок окна:",
-            font=("Arial", 9),
-            bg="#1e1e1e",
-            fg="#888888"
-        )
-        hint.pack(pady=(0, 10))
-
-        list_frame = tk.Frame(dialog, bg="#1e1e1e")
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
-
-        scrollbar = tk.Scrollbar(list_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        listbox = tk.Listbox(
-            list_frame,
-            bg="#2d2d2d",
-            fg="#e0e0e0",
-            selectbackground="#4CAF50",
-            selectforeground="white",
-            font=("Consolas", 10),
-            relief=tk.FLAT,
-            yscrollcommand=scrollbar.set,
-            activestyle="none"
-        )
-        listbox.pack(fill=tk.BOTH, expand=True)
-        scrollbar.config(command=listbox.yview)
-
-        for w in windows:
-            title = w['title']
-            if len(title) > 60:
-                title = title[:57] + "..."
-            display = f"{w['process']}  |  {title}  ({w['width']}x{w['height']})"
-            listbox.insert(tk.END, display)
-
-        if windows:
-            listbox.selection_set(0)
-
-        def on_double_click(event):
-            self._confirm_window_selection(windows, listbox)
-
-        listbox.bind("<Double-Button-1>", on_double_click)
-
-        btn_frame = tk.Frame(dialog, bg="#1e1e1e")
-        btn_frame.pack(fill=tk.X, padx=20, pady=15)
-
-        def on_select_click():
-            self._confirm_window_selection(windows, listbox)
-
-        select_btn = tk.Button(
-            btn_frame,
-            text="✅ Выбрать",
-            command=on_select_click,
-            font=("Arial", 10, "bold"),
-            bg="#4CAF50",
-            fg="white",
-            relief=tk.FLAT,
-            padx=25,
-            pady=8,
-            cursor="hand2"
-        )
-        select_btn.pack(side=tk.LEFT, padx=(0, 10), expand=True, fill=tk.X)
-
-        cancel_btn = tk.Button(
-            btn_frame,
-            text="❌ Отмена",
-            command=self._cancel_window_selection,
-            font=("Arial", 10),
-            bg="#3c3c3c",
-            fg="white",
-            relief=tk.FLAT,
-            padx=25,
-            pady=8,
-            cursor="hand2"
-        )
-        cancel_btn.pack(side=tk.LEFT, padx=(10, 0), expand=True, fill=tk.X)
-
-        dialog.bind("<Escape>", lambda e: self._cancel_window_selection())
-        dialog.protocol("WM_DELETE_WINDOW", self._cancel_window_selection)
-
-        dialog.focus_force()
-
-    def _confirm_window_selection(self, windows, listbox):
-        sel = listbox.curselection()
-        if not sel:
-            return
-        idx = sel[0]
-        if idx < 0 or idx >= len(windows):
-            return
-
-        w = windows[idx]
-        self.selected_hwnd = w['hwnd']
-        self.selected_window_title = w['title']
-
-        title = w['title']
-        if len(title) > 40:
-            title = title[:37] + "..."
-        self.window_status.config(
-            text=f"🟢 Окно: {title} ({w['process']})"
-        )
-        self.log(f"✅ Выбрано окно: {w['title']} ({w['process']})")
-
-        self._close_window_select_dialog()
-
-        cb = self._on_window_selected_callback
-        self._on_window_selected_callback = None
-        if cb is not None:
-            try:
-                cb(self.selected_hwnd, self.selected_window_title)
-            except Exception as e:
-                self.log(f"⚠️ Ошибка callback выбора окна: {e}")
-
-    def _cancel_window_selection(self):
-        self.log("❌ Выбор окна отменён")
-        self._close_window_select_dialog()
-        self._on_window_selected_callback = None
-
-    def _close_window_select_dialog(self):
-        if self._window_select_dialog is not None:
-            try:
-                self._window_select_dialog.grab_release()
-                self._window_select_dialog.destroy()
-            except Exception:
-                pass
-            self._window_select_dialog = None
 
     # ============================================================
     # ADB / УСТРОЙСТВА
@@ -427,21 +257,40 @@ class SimplePhoneTranslator:
             if not self.adb_ready:
                 return
 
-        self.log("🪟 Выберите окно для трансляции...")
-        self._show_window_selection_dialog(self._on_window_selected_start_stream)
+        self.log("🪟 Определение активного окна...")
+        self._do_start_streaming()
 
-    def _on_window_selected_start_stream(self, hwnd, title):
-        import win32gui
-        if not win32gui.IsWindow(hwnd):
-            self.log("❌ Выбранное окно больше не существует")
-            self.selected_hwnd = None
-            self.selected_window_title = None
-            self.window_status.config(text="🪟 Окно: будет выбрано при старте")
-            return
+    def _get_our_hwnds(self):
+        """
+        Возвращает список HWND наших окон (главное окно + окно оверлея),
+        которые нельзя захватывать.
+        """
+        hwnds = []
+        try:
+            hwnds.append(int(self.root.winfo_id()))
+        except Exception:
+            pass
+        if self.ocr_overlay is not None:
+            try:
+                hwnds.append(int(self.ocr_overlay.window.winfo_id()))
+            except Exception:
+                pass
+        return hwnds
 
-        self._do_start_streaming(hwnd, title)
+    def on_hwnd_changed(self, hwnd, title):
+        """Callback от WindowStreamer при смене активного окна."""
+        try:
+            short = title if len(title) <= 40 else title[:37] + "..."
+            self.window_status.config(text=f"🟢 Окно: {short}")
+        except Exception:
+            pass
+        if self.ocr_overlay is not None:
+            try:
+                self.ocr_overlay.set_target_hwnd(hwnd)
+            except Exception as e:
+                self.log(f"⚠️ Ошибка смены HWND в оверлее: {e}")
 
-    def _do_start_streaming(self, hwnd, title):
+    def _do_start_streaming(self):
         self.streaming = True
         self.start_btn.config(text="⏹  ОСТАНОВИТЬ", bg="#f44336")
         self.stream_status.config(text="🟢 Трансляция: запущена")
@@ -463,42 +312,64 @@ class SimplePhoneTranslator:
                 self.log("⚠️ Debug-сервер не запустился")
                 self.debug_receiver = None
 
-            # 3. MJPEG-стример (порт 5005)
+            # 3. MJPEG-стример (порт 5005) — сам определит активное окно
             self.pc_streamer = WindowStreamer()
             self.pc_streamer.set_device(self.selected_device)
-            self.pc_streamer.set_window(hwnd, title)
 
-            # 4. Прозрачный ОВЕРЛЕЙ поверх исходного окна
-            #    target_hwnd — HWND исходного окна, чтобы оверлей
-            #    знал, где рисовать и как масштабировать.
+            # Передаём список наших окон, чтобы их не захватывал
+            our_hwnds = self._get_our_hwnds()
+            self.pc_streamer.set_our_hwnds(our_hwnds)
+            self.pc_streamer.set_on_hwnd_changed(self.on_hwnd_changed)
+
+            # 4. Прозрачный ОВЕРЛЕЙ — создаём с target_hwnd=0 (невидим),
+            #    потом set_target_hwnd() при первом появлении активного окна.
             self.ocr_overlay = OcrOverlayWindow(
                 self.root,
                 self.ocr_receiver,
-                target_hwnd=hwnd,
+                target_hwnd=0,
                 pc_streamer=self.pc_streamer,
                 on_close=self.on_overlay_closed
             )
+            # Обновляем список наших HWND с учётом оверлея
+            our_hwnds = self._get_our_hwnds()
+            self.pc_streamer.set_our_hwnds(our_hwnds)
 
             # 5. Запускаем стример в отдельном потоке
             def _start_streamer():
                 ok = self.pc_streamer.start()
                 if not ok:
                     self.root.after(0, self._on_streamer_start_failed)
+                else:
+                    # После успешного старта — если стартовое окно было,
+                    # синхронизируем target_hwnd оверлея.
+                    try:
+                        hwnd = self.pc_streamer.hwnd
+                        title = self.pc_streamer.window_title or "?"
+                        if hwnd:
+                            self.root.after(0, lambda: self.on_hwnd_changed(hwnd, title))
+                        else:
+                            # Окна не было — ждём, watcher подхватит.
+                            self.root.after(0, lambda: self.window_status.config(
+                                text="🪟 Окно: ожидание активного..."
+                            ))
+                    except Exception:
+                        pass
 
             threading.Thread(target=_start_streamer, daemon=True).start()
 
-            self.log("🚀 Запуск трансляции...")
+            self.log("🚀 Запуск трансляции активного окна...")
             self.log(f"📱 Устройство: {self.selected_device}")
-            self.log(f"🪟 Окно: {title}")
             self.log("ℹ️ Запустите Android-приложение и нажмите 'Старт OCR ПК'")
+            self.log("ℹ️ Трансляция автоматически переключается на активное окно")
 
             dbg.log_event("pc.simple_gui_stream_started")
 
     def _on_streamer_start_failed(self):
-        self.log("❌ Не удалось запустить трансляцию (первый кадр не получен)")
+        self.log("❌ Не удалось запустить трансляцию (HTTP-сервер не поднялся)")
         self.streaming = False
         self.start_btn.config(text="▶  НАЧАТЬ", bg="#4CAF50")
         self.stream_status.config(text="🔴 Трансляция: остановлена")
+        self.window_status.config(text="🪟 Окно: активное (авто)")
         self._cleanup_streamer()
         self._update_start_btn_state()
 
@@ -538,6 +409,7 @@ class SimplePhoneTranslator:
         self.streaming = False
         self.start_btn.config(text="▶  НАЧАТЬ", bg="#4CAF50")
         self.stream_status.config(text="🔴 Трансляция: остановлена")
+        self.window_status.config(text="🪟 Окно: активное (авто)")
 
         threading.Thread(target=self._cleanup_streamer, daemon=True).start()
 
@@ -663,13 +535,26 @@ class SimplePhoneTranslator:
             ("===OK===", "Если всё сделано правильно — появится \"✅ ADB: <серийник> (USB)\""),
             ("", ""),
             ("===H2===", "Шаг 2. Нажмите \"▶ НАЧАТЬ\""),
-            ("", "Откроется диалог выбора окна. Выберите окно, которое нужно переводить."),
-            ("===WARN===", "ВАЖНО: не выбирайте окно \"Translate via Phone\" — его нельзя захватить!"),
+            ("", "Трансляция начнётся автоматически с активного окна Windows."),
+            ("===WARN===", "Просто переключите фокус на нужное окно — трансляция подхватит его сама."),
+            ("", "Окно оверлея и окно программы не захватываются автоматически."),
             ("", ""),
             ("===H2===", "Шаг 3. Запустите Android-приложение"),
             ("", "1. Откройте на телефоне приложение ScreenTranslator2"),
             ("", "2. Нажмите \"Старт OCR ПК\""),
             ("", "3. Поверх исходного окна появится перевод"),
+            ("", ""),
+            ("===H1===", "Как работает автопереключение"),
+            ("", ""),
+            ("", "Программа каждые 300 мс проверяет активное окно Windows."),
+            ("", "Как только вы переключитесь на другое окно — трансляция"),
+            ("", "автоматически переключится на него БЕЗ перезапуска потоков."),
+            ("", "Это значит, что MJPEG-поток на телефоне не прервётся."),
+            ("", ""),
+            ("===WARN===", "Окно \"Translate via Phone\" и окно оверлея игнорируются."),
+            ("", "Если на момент старта нет подходящего окна — программа"),
+            ("", "перейдёт в режим ожидания и подхватит окно, как только"),
+            ("", "вы переключитесь на него."),
             ("", ""),
             ("===H1===", "Решение проблем"),
             ("", ""),
@@ -711,8 +596,8 @@ class SimplePhoneTranslator:
             ("", "Если их нет — Android не подключается к ПК."),
             ("", ""),
             ("===H2===", "❌ Захватывается не то окно / чёрный экран"),
-            ("", "1. Убедитесь, что вы выбрали нужное окно в диалоге"),
-            ("===WARN===", "НЕ выбирайте \"Translate via Phone\" — своё окно захватить нельзя."),
+            ("", "1. Переключите фокус на нужное окно — трансляция подхватит его автоматически."),
+            ("===WARN===", "НЕ переключайтесь на \"Translate via Phone\" — оно игнорируется."),
             ("", "2. Некоторые приложения (игры с DirectX) не захватываются через PrintWindow."),
             ("", "3. Попробуйте другое окно для проверки."),
             ("", ""),
@@ -733,7 +618,7 @@ class SimplePhoneTranslator:
             ("===H2===", "🔄 Обновить"),
             ("", "Пересканировать подключённые устройства. Автообновление каждые 3 сек."),
             ("===H2===", "▶ НАЧАТЬ"),
-            ("", "Откроет диалог выбора окна, затем запустит трансляцию на телефон."),
+            ("", "Запустит трансляцию активного окна на телефон."),
             ("===H2===", "⏹ ОСТАНОВИТЬ"),
             ("", "Остановить трансляцию."),
             ("", ""),
@@ -780,7 +665,6 @@ class SimplePhoneTranslator:
             self._auto_refresh_timer = None
 
         self._close_help_window()
-        self._close_window_select_dialog()
 
         if self.streaming:
             self.streaming = False

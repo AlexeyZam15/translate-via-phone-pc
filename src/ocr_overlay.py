@@ -4,6 +4,24 @@
 Показывает только текст перевода (и фон под ним),
 не дублирует кадр ПК. Позиция и размер = клиентская область
 исходного окна (target_hwnd).
+
+Поддерживает динамическую смену целевого окна (set_target_hwnd).
+
+Прозрачность фона управляется параметром alpha (0..255):
+  alpha >= 240  — фон полностью непрозрачный (сплошная заливка)
+  alpha <= 15   — фон полностью прозрачный (не рисуется)
+  иначе         — фон рисуется через stipple с градацией
+
+Стабилизация блоков:
+  Блок фиксируется при первом появлении и держит позицию, пока
+  текст остаётся. Микро-сдвиги координат от OCR (в пределах
+  STABLE_MATCH_TOLERANCE_PX) игнорируются — блок не дёргается.
+  Если блок не появляется STABLE_MISS_LIMIT раз подряд — удаляется.
+
+Режимы:
+  "translate" — рисовать перевод (фон + текст)
+  "debug"     — рисовать рамки + OCR-текст + confidence
+  "ocr"       — устаревший, не рисуется (см. _redraw)
 """
 
 import hashlib
@@ -21,12 +39,23 @@ from src.debug_logger import logger as dbg
 # становится полностью прозрачным (видно окно под оверлеем).
 TRANSPARENT_COLOR = "#010101"
 
+# Пороги для краевых случаев прозрачности
+ALPHA_SOLID_THRESHOLD = 240  # >= — сплошная заливка
+ALPHA_TRANSPARENT_THRESHOLD = 15  # <= — фон не рисуется
+
+# Стабилизация блоков
+STABLE_MATCH_TOLERANCE_PX = 40  # допуск по расстоянию центров
+STABLE_MISS_LIMIT = 2  # сколько пропусков до удаления блока
+
+# Если данных от OCR нет дольше этого времени — не перерисовываем
+STALE_DATA_TIMEOUT = 2.0
+
 
 def _blocks_fingerprint(blocks) -> str:
-    """Хэш содержимого блоков — чтобы не перерисовывать без изменений."""
+    """Быстрый хэш содержимого блоков для детекции изменений."""
     h = hashlib.md5()
     for b in blocks:
-        h.update(str(b.get('text', '')).encode('utf-8', errors='ignore'))
+        h.update(b.get('text', '').encode('utf-8', errors='ignore'))
         h.update(b'|')
         h.update(str(b.get('x', 0)).encode())
         h.update(b',')
@@ -39,13 +68,21 @@ def _blocks_fingerprint(blocks) -> str:
     return h.hexdigest()
 
 
+def _center(block):
+    """Возвращает центр блока (cx, cy) по x/y/w/h."""
+    return (
+        block.get('x', 0) + block.get('w', 0) // 2,
+        block.get('y', 0) + block.get('h', 0) // 2,
+    )
+
+
 class OcrOverlayWindow:
     """Прозрачное окно поверх исходного окна ПК."""
 
     MIN_FONT_SIZE = 6
     MAX_FONT_SIZE = 72
-    POLL_INTERVAL_MS = 250  # опрос OCR-блоков
-    POSITION_INTERVAL_MS = 400  # слежение за позицией окна
+    POLL_INTERVAL_MS = 100  # опрос OCR-блоков (быстрее реакция)
+    POSITION_INTERVAL_MS = 250  # слежение за позицией окна
 
     def __init__(self, root, receiver: OcrReceiver, target_hwnd: int,
                  pc_streamer=None, on_close=None):
@@ -81,14 +118,17 @@ class OcrOverlayWindow:
         self._font_cache = {}
         self._fitted_cache = {}
 
-        # Состояние
+        # Стабильные блоки — то, что реально нарисовано на экране.
+        self._stable_blocks = []
+
+        # Состояние предыдущей отрисовки
         self._last_fingerprint = None
         self._last_mode = None
         self._last_alpha = None
         self._last_frame_size = (0, 0)
 
         # Кэш rect окна
-        self._cached_client_rect = None  # (x, y, w, h)
+        self._cached_client_rect = None
         self._last_client_rect_ts = 0.0
 
         # Таймеры
@@ -97,22 +137,51 @@ class OcrOverlayWindow:
 
         # Стартуем
         dbg.log_event("pc.overlay_create", {"target_hwnd": target_hwnd})
-        self._update_position()
+        if target_hwnd:
+            self._update_position()
+        else:
+            try:
+                self.window.withdraw()
+            except Exception:
+                pass
         self._poll()
         self._position_loop()
+
+    # ============================================================
+    # Смена целевого окна
+    # ============================================================
+
+    def set_target_hwnd(self, hwnd: int):
+        """Меняет целевое окно. Сбрасывает стабильные блоки и кэш."""
+        if hwnd == self.target_hwnd:
+            return
+        print(f"[Overlay] 🔄 Смена целевого окна: {self.target_hwnd} → {hwnd}")
+        dbg.log_event("pc.overlay_target_changed",
+                      {"old": self.target_hwnd, "new": hwnd})
+        self.target_hwnd = hwnd
+        self._cached_client_rect = None
+        self._last_client_rect_ts = 0.0
+        self._last_fingerprint = None
+        self._last_frame_size = (0, 0)
+        self._stable_blocks = []
+        try:
+            self.canvas.delete("all")
+        except Exception:
+            pass
+        try:
+            if hwnd:
+                self._update_position()
+            else:
+                self.window.withdraw()
+        except Exception:
+            pass
 
     # ============================================================
     # Слежение за позицией исходного окна
     # ============================================================
 
     def _get_client_rect_on_screen(self, use_cache: bool = True):
-        """
-        Возвращает координаты клиентской области исходного окна
-        на экране: (x, y, width, height) или None.
-
-        use_cache=True — использует закэшированный rect, если он моложе
-        POSITION_INTERVAL_MS.
-        """
+        """Возвращает (x, y, w, h) клиентской области или None."""
         now = time.time()
         if (use_cache
                 and self._cached_client_rect is not None
@@ -140,6 +209,12 @@ class OcrOverlayWindow:
 
     def _update_position(self):
         """Подгоняет окно оверлея под клиентскую область исходного окна."""
+        if not self.target_hwnd:
+            try:
+                self.window.withdraw()
+            except Exception:
+                pass
+            return
         rect = self._get_client_rect_on_screen(use_cache=False)
         if rect is None:
             try:
@@ -162,7 +237,8 @@ class OcrOverlayWindow:
 
     def _position_loop(self):
         try:
-            self._update_position()
+            if self.target_hwnd:
+                self._update_position()
         except Exception:
             pass
         try:
@@ -190,24 +266,40 @@ class OcrOverlayWindow:
             pass
 
     def _refresh(self):
+        if not self.target_hwnd:
+            return
         if not win32gui.IsWindow(self.target_hwnd):
             return
         if win32gui.IsIconic(self.target_hwnd):
+            return
+
+        # Если данные от OCR устарели — не трогаем оверлей.
+        last_ts = getattr(self.receiver, 'last_received_ts', 0.0)
+        if last_ts > 0 and (time.time() - last_ts) > STALE_DATA_TIMEOUT:
             return
 
         blocks, (fw, fh) = self.receiver.get_blocks()
         mode = self.receiver.get_mode()
         alpha = self.receiver.get_alpha()
 
-        # Проверяем, изменилось ли содержимое блоков
-        fp = _blocks_fingerprint(blocks)
-        same = (
-                fp == self._last_fingerprint
+        # --- Пустой результат: текст исчез, очищаем всё сразу ---
+        if not blocks:
+            if self._stable_blocks:
+                self._stable_blocks = []
+                self._last_fingerprint = None
+                self.canvas.delete("all")
+                dbg.log_event("pc.overlay_cleared")
+            return
+
+        # --- Стабилизация блоков ---
+        self._stabilize_blocks(blocks)
+
+        # --- Проверка: изменилось ли что-то для отрисовки? ---
+        fp = _blocks_fingerprint(self._stable_blocks)
+        if (fp == self._last_fingerprint
                 and mode == self._last_mode
                 and alpha == self._last_alpha
-                and (fw, fh) == self._last_frame_size
-        )
-        if same:
+                and (fw, fh) == self._last_frame_size):
             return
 
         self._last_fingerprint = fp
@@ -215,11 +307,70 @@ class OcrOverlayWindow:
         self._last_alpha = alpha
         self._last_frame_size = (fw, fh)
 
-        if not blocks:
-            self.canvas.delete("all")
-            return
+        self._redraw(self._stable_blocks, fw, fh, mode, alpha)
 
-        self._redraw(blocks, fw, fh, mode, alpha)
+    def _stabilize_blocks(self, new_blocks):
+        """
+        Стабилизирует блоки: микро-сдвиги координат игнорируются,
+        блок «схватывается» при первом появлении и держит позицию,
+        пока текст остаётся.
+        """
+        tol = STABLE_MATCH_TOLERANCE_PX
+        tol2 = tol * tol
+
+        used_new = [False] * len(new_blocks)
+        new_stable = []
+
+        for sb in self._stable_blocks:
+            sb_text = sb.get('text', '')
+            sb_cx, sb_cy = _center(sb)
+
+            best_idx = -1
+            best_d2 = tol2
+            for i, nb in enumerate(new_blocks):
+                if used_new[i]:
+                    continue
+                if nb.get('text', '') != sb_text:
+                    continue
+                nb_cx, nb_cy = _center(nb)
+                dx = nb_cx - sb_cx
+                dy = nb_cy - sb_cy
+                d2 = dx * dx + dy * dy
+                if d2 <= best_d2:
+                    best_d2 = d2
+                    best_idx = i
+
+            if best_idx >= 0:
+                nb = new_blocks[best_idx]
+                used_new[best_idx] = True
+                sb['confidence'] = nb.get('confidence', sb.get('confidence', 0.0))
+                sb['miss_count'] = 0
+                new_stable.append(sb)
+            else:
+                miss = sb.get('miss_count', 0) + 1
+                if miss <= STABLE_MISS_LIMIT:
+                    sb['miss_count'] = miss
+                    new_stable.append(sb)
+
+        for i, nb in enumerate(new_blocks):
+            if used_new[i]:
+                continue
+            sb = {
+                'text': nb.get('text', ''),
+                'x': nb.get('x', 0),
+                'y': nb.get('y', 0),
+                'w': nb.get('w', 0),
+                'h': nb.get('h', 0),
+                'confidence': nb.get('confidence', 0.0),
+                'initial_x': nb.get('initial_x', nb.get('x', 0)),
+                'initial_y': nb.get('initial_y', nb.get('y', 0)),
+                'initial_w': nb.get('initial_w', nb.get('w', 0)),
+                'initial_h': nb.get('initial_h', nb.get('h', 0)),
+                'miss_count': 0,
+            }
+            new_stable.append(sb)
+
+        self._stable_blocks = new_stable
 
     # ============================================================
     # Отрисовка
@@ -233,7 +384,6 @@ class OcrOverlayWindow:
         return False
 
     def _redraw(self, blocks, frame_w, frame_h, mode, alpha):
-        """Рисует блоки на canvas. Координаты OCR → пиксели клиентской области."""
         if not self.target_hwnd:
             return
         rect = self._get_client_rect_on_screen(use_cache=True)
@@ -249,95 +399,197 @@ class OcrOverlayWindow:
 
         self.canvas.delete("all")
 
+        # ИЗМЕНЕНО: режим "ocr" больше не используется — при неготовом
+        # переводчике Android вообще ничего не шлёт. Но на всякий случай
+        # (старый клиент) — не рисуем ничего.
         if mode == "debug":
-            self._draw_debug(blocks, scale_x, scale_y)
+            self._draw_debug(blocks, scale_x, scale_y, show_confidence=True)
+        elif mode == "ocr":
+            # Ничего не рисуем — это сырой OCR, не перевод.
+            pass
         else:
             self._draw_translation(blocks, scale_x, scale_y, alpha)
 
+    def _stipple_from_alpha(self, alpha: int):
+        """
+        Режим заливки фона:
+          None     — не рисовать (полная прозрачность, alpha <= 15)
+          "solid"  — сплошная заливка (полная непрозрачность, alpha >= 240)
+          строка   — имя stipple-паттерна
+        """
+        if alpha <= ALPHA_TRANSPARENT_THRESHOLD:
+            return None
+        if alpha >= ALPHA_SOLID_THRESHOLD:
+            return "solid"
+        if alpha < 64:
+            return "gray12"
+        elif alpha < 128:
+            return "gray25"
+        elif alpha < 192:
+            return "gray50"
+        else:
+            return "gray75"
+
     def _draw_translation(self, blocks, scale_x, scale_y, alpha):
         """Режим перевода: прямоугольники фона + текст."""
+        fill_mode = self._stipple_from_alpha(alpha)
+        create_rect = self.canvas.create_rectangle
+        has_letters = self._has_letters
+        draw_text = self._draw_fitted_text
+
         for b in blocks:
-            bx = b.get('x', 0)
-            by = b.get('y', 0)
+            text = b.get('text', '')
+            if not text or not has_letters(text):
+                continue
             bw = b.get('w', 0)
             bh = b.get('h', 0)
-            text = b.get('text', '')
-            if bw <= 0 or bh <= 0 or not text:
-                continue
-            if not self._has_letters(text):
-                continue
-
-            x1 = bx * scale_x
-            y1 = by * scale_y
-            x2 = (bx + bw) * scale_x
-            y2 = (by + bh) * scale_y
-
-            # Фон под текстом — полупрозрачный через stipple
-            self.canvas.create_rectangle(
-                x1, y1, x2, y2,
-                fill="#000000",
-                outline="",
-                stipple="gray75",
-                tags=("bg",)
-            )
-
-            self._draw_fitted_text(
-                text, x1 + 2, y1 + 2,
-                max(1, (x2 - x1) - 4),
-                max(1, (y2 - y1) - 4)
-            )
-
-    def _draw_debug(self, blocks, scale_x, scale_y):
-        """Режим отладки: рамки + текст + уверенность."""
-        for b in blocks:
-            bx = b.get('x', 0)
-            by = b.get('y', 0)
-            bw = b.get('w', 0)
-            bh = b.get('h', 0)
-            text = b.get('text', '')
-            conf = b.get('confidence', 0.0)
             if bw <= 0 or bh <= 0:
                 continue
 
-            x1 = bx * scale_x
-            y1 = by * scale_y
-            x2 = (bx + bw) * scale_x
-            y2 = (by + bh) * scale_y
+            x1 = b.get('x', 0) * scale_x
+            y1 = b.get('y', 0) * scale_y
+            x2 = (b.get('x', 0) + bw) * scale_x
+            y2 = (b.get('y', 0) + bh) * scale_y
 
-            init_x = b.get('initial_x', bx)
-            init_y = b.get('initial_y', by)
-            init_w = b.get('initial_w', bw)
-            init_h = b.get('initial_h', bh)
-            ix1 = init_x * scale_x
-            iy1 = init_y * scale_y
-            ix2 = (init_x + init_w) * scale_x
-            iy2 = (init_y + init_h) * scale_y
+            if fill_mode == "solid":
+                create_rect(x1, y1, x2, y2, fill="#000000",
+                            outline="", tags=("bg",))
+            elif fill_mode is not None:
+                create_rect(x1, y1, x2, y2, fill="#000000",
+                            outline="", stipple=fill_mode, tags=("bg",))
 
-            self.canvas.create_rectangle(
-                ix1, iy1, ix2, iy2,
-                outline="#00ff00", width=2
-            )
-            self.canvas.create_rectangle(
-                x1, y1, x2, y2,
-                outline="#ff0000", width=2
-            )
+            draw_text(text, x1 + 2, y1 + 2,
+                      max(1, (x2 - x1) - 4), max(1, (y2 - y1) - 4))
+
+    def _draw_debug(self, blocks, scale_x, scale_y, show_confidence=True):
+        """Режим отладки: рамки + текст + (опционально) уверенность.
+
+        ИЗМЕНЕНО:
+          - показывается ПОЛНЫЙ OCR-текст (раньше было text[:40] — обрезался);
+          - если над рамкой нет места (верхний край окна), текст рисуется
+            ВНУТРИ рамки, а не над ней;
+          - задана width у create_text — длинный текст переносится по словам;
+          - под текстом рисуется полупрозрачный фон для читаемости;
+          - ограничение MAX_LABEL_LINES = 4 строки, чтобы текст не закрывал
+            собой всю рамку.
+        """
+        create_rect = self.canvas.create_rectangle
+        create_text = self.canvas.create_text
+
+        # Размеры шрифта и отступы для подписи
+        label_font = ("Consolas", 10, "bold")
+        try:
+            label_line_height = tkfont.Font(family="Consolas", size=10,
+                                            weight="bold").metrics("linespace")
+        except Exception:
+            label_line_height = 14
+        label_pad_x = 6
+        label_pad_y = 4
+        MAX_LABEL_LINES = 4
+
+        # Ширина canvas — чтобы ограничить перенос текста
+        try:
+            canvas_w = self.canvas.winfo_width()
+            if canvas_w <= 1:
+                canvas_w = self.canvas.winfo_reqwidth()
+        except Exception:
+            canvas_w = 800
+
+        for b in blocks:
+            bw = b.get('w', 0)
+            bh = b.get('h', 0)
+            if bw <= 0 or bh <= 0:
+                continue
+
+            x1 = b.get('x', 0) * scale_x
+            y1 = b.get('y', 0) * scale_y
+            x2 = (b.get('x', 0) + bw) * scale_x
+            y2 = (b.get('y', 0) + bh) * scale_y
+
+            ix1 = b.get('initial_x', b.get('x', 0)) * scale_x
+            iy1 = b.get('initial_y', b.get('y', 0)) * scale_y
+            ix2 = (b.get('initial_x', b.get('x', 0))
+                   + b.get('initial_w', bw)) * scale_x
+            iy2 = (b.get('initial_y', b.get('y', 0))
+                   + b.get('initial_h', bh)) * scale_y
+
+            create_rect(ix1, iy1, ix2, iy2, outline="#00ff00", width=2)
+            create_rect(x1, y1, x2, y2, outline="#ff0000", width=2)
+
+            text = b.get('text', '')
             if text:
-                self.canvas.create_text(
-                    x1 + 2, y1 - 4, text=text[:40],
-                    fill="#ffff00", anchor="sw",
-                    font=("Consolas", 10, "bold")
+                # Ширина для переноса: не больше ширины canvas и не больше
+                # ширины рамки + запас (чтобы текст мог вылезать за рамку
+                # горизонтально, но не уходил за экран).
+                max_text_w = max(120, int(canvas_w - x1 - 10))
+                # Ограничим сверху — чтобы подпись не растягивалась
+                # на пол-экрана из-за одной длинной строки без пробелов.
+                max_text_w = min(max_text_w, 600)
+                max_text_w = max(max_text_w, 80)
+
+                # Оцениваем высоту подписи (максимум MAX_LABEL_LINES строк).
+                # Точную высоту Tkinter вернёт только после create_text,
+                # поэтому берём оценку по длине текста и ширине.
+                approx_chars_per_line = max(1, int(max_text_w / 7))
+                approx_lines = min(
+                    MAX_LABEL_LINES,
+                    max(1, (len(text) + approx_chars_per_line - 1)
+                        // approx_chars_per_line)
                 )
-            try:
-                conf_val = float(conf)
-                if conf_val > 0:
-                    self.canvas.create_text(
-                        x2 + 6, y1 + 2,
-                        text=f"{conf_val * 100:.0f}%",
-                        fill="#00ff00", anchor="nw",
-                        font=("Consolas", 10, "bold")
-                    )
-            except (TypeError, ValueError):
-                pass
+                label_h = approx_lines * label_line_height + label_pad_y * 2
+                label_w = max_text_w + label_pad_x * 2
+
+                # Позиция подписи:
+                #   по умолчанию — НАД рамкой (anchor="nw", y = y1 - label_h),
+                #   но если сверху не хватает места — ВНУТРИ рамки
+                #   (y = y1 + 2), с выравниванием по левому краю рамки.
+                if y1 - label_h >= 0:
+                    label_x = x1
+                    label_y = y1 - label_h
+                else:
+                    label_x = x1
+                    label_y = y1 + 2
+
+                # Не даём подписи уйти за правый край canvas
+                if label_x + label_w > canvas_w:
+                    label_x = max(0, canvas_w - label_w - 2)
+
+                # Фон под текстом — полупрозрачный чёрный
+                create_rect(
+                    label_x, label_y,
+                    label_x + label_w, label_y + label_h,
+                    fill="#000000", outline="#444444", width=1
+                )
+                create_text(
+                    label_x + label_pad_x,
+                    label_y + label_pad_y,
+                    text=text,
+                    fill="#ffff00",
+                    anchor="nw",
+                    font=label_font,
+                    width=max_text_w
+                )
+
+            if show_confidence:
+                conf = b.get('confidence', 0.0)
+                try:
+                    conf_val = float(conf)
+                    if conf_val > 0:
+                        conf_text = f"{conf_val * 100:.0f}%"
+                        conf_x = x2 + 6
+                        conf_y = y1 + 2
+                        # Если справа нет места — рисуем слева от рамки
+                        if conf_x + 40 > canvas_w:
+                            conf_x = max(0, x1 - 44)
+                        # Если сверху нет места — чуть ниже
+                        if conf_y < 0:
+                            conf_y = y2 + 2
+                        create_text(conf_x, conf_y,
+                                    text=conf_text,
+                                    fill="#00ff00", anchor="nw",
+                                    font=("Consolas", 10, "bold"))
+                except (TypeError, ValueError):
+                    pass
 
     # ============================================================
     # Шрифты и подгонка текста
@@ -351,10 +603,6 @@ class OcrOverlayWindow:
         return f
 
     def _draw_fitted_text(self, text, x, y, max_w, max_h):
-        """
-        Рисует текст, подбирая размер шрифта под размеры блока.
-        Использует кэш fitted-размера по ключу (text, max_w, max_h).
-        """
         max_w = max(1, int(max_w))
         max_h = max(1, int(max_h))
 

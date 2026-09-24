@@ -1,5 +1,13 @@
 # src/pc_streamer.py
-"""Захват выбранного окна Windows через PrintWindow + MJPEG + ADB reverse."""
+"""Захват активного окна Windows через PrintWindow + MJPEG + ADB reverse.
+
+Трансляция автоматически переключается на активное (foreground) окно.
+При смене окна НЕ перезапускает потоки — просто меняет HWND.
+
+Если на момент старта нет подходящего активного окна — стример
+запускается в режиме ожидания и подхватывает окно, как только оно
+появится (через window_watcher_loop).
+"""
 
 import cv2
 import numpy as np
@@ -25,10 +33,14 @@ from src.config import (
     FIRST_FRAME_TIMEOUT,
 )
 from src.debug_logger import logger as dbg
+from src import window_utils
+
+# Интервал опроса активного окна (сек)
+WINDOW_WATCH_INTERVAL = 0.3
 
 
 class WindowStreamer:
-    """Трансляция выбранного окна через PrintWindow + MJPEG + ADB reverse."""
+    """Трансляция активного окна через PrintWindow + MJPEG + ADB reverse."""
 
     def __init__(self):
         self.hwnd = None
@@ -38,6 +50,13 @@ class WindowStreamer:
         self.streaming = False
         self.server = None
         self.server_thread = None
+
+        # HWND наших окон (главное окно приложения, оверлей) — их нельзя захватывать
+        self._our_hwnds = []
+        self._our_hwnds_lock = threading.Lock()
+
+        # Callback при смене активного окна
+        self._on_hwnd_changed = None
 
         self._gdi = {
             'hdc': None,
@@ -57,12 +76,46 @@ class WindowStreamer:
 
         self.capture_thread = None
         self.encode_thread = None
+        self.window_watcher_thread = None
 
-    def set_window(self, hwnd, title):
+        # Флаг, что текущее окно было закрыто (чтобы не спамить лог)
+        self._window_lost = False
+
+    # ============================================================
+    # Настройка
+    # ============================================================
+
+    def set_our_hwnds(self, hwnds):
+        """Устанавливает список HWND наших окон (не захватывать)."""
+        with self._our_hwnds_lock:
+            self._our_hwnds = [h for h in hwnds if h]
+
+    def set_on_hwnd_changed(self, callback):
+        """Устанавливает callback, вызываемый при смене активного окна."""
+        self._on_hwnd_changed = callback
+
+    def _get_our_hwnds(self):
+        with self._our_hwnds_lock:
+            return list(self._our_hwnds)
+
+    def set_active_hwnd(self, hwnd, title):
+        """
+        Меняет активное окно БЕЗ перезапуска потоков.
+        GDI пересоздастся автоматически в capture_loop.
+        """
+        if hwnd == self.hwnd:
+            return
+        old = self.hwnd
         self.hwnd = hwnd
         self.window_title = title
-        print(f"[PC-Stream] ✅ Окно установлено: {title} (HWND={hwnd})")
-        dbg.log_event("pc.stream_set_window", {"hwnd": hwnd, "title": title})
+        self._window_lost = False
+        print(f"[PC-Stream] 🔄 Активное окно: {title} (HWND={hwnd}, было {old})")
+        dbg.log_event("pc.window_changed", {"hwnd": hwnd, "title": title, "old": old})
+        if self._on_hwnd_changed is not None:
+            try:
+                self._on_hwnd_changed(hwnd, title)
+            except Exception as e:
+                print(f"[PC-Stream] ⚠️ on_hwnd_changed error: {e}")
 
     def set_device(self, device_serial):
         self.selected_device = device_serial
@@ -78,6 +131,10 @@ class WindowStreamer:
     def get_jpeg(self):
         with self.frame_lock:
             return self.current_frame_jpeg
+
+    # ============================================================
+    # GDI
+    # ============================================================
 
     def _release_gdi(self):
         gdi = self._gdi
@@ -207,6 +264,33 @@ class WindowStreamer:
         except Exception:
             return None
 
+    # ============================================================
+    # Наблюдение за активным окном
+    # ============================================================
+
+    def window_watcher_loop(self):
+        print("[PC-Stream] 👁️ Наблюдение за активным окном запущено")
+        dbg.log_event("pc.window_watcher_start")
+        while self.streaming:
+            try:
+                our = self._get_our_hwnds()
+                fg = window_utils.get_foreground_window(our_hwnds=our)
+                if fg is not None and fg != self.hwnd:
+                    try:
+                        title = win32gui.GetWindowText(fg)
+                    except Exception:
+                        title = "?"
+                    self.set_active_hwnd(fg, title)
+            except Exception as e:
+                dbg.log_event("pc.window_watcher_error", {"error": str(e)})
+            time.sleep(WINDOW_WATCH_INTERVAL)
+        print("[PC-Stream] 👁️ Наблюдение за активным окном остановлено")
+        dbg.log_event("pc.window_watcher_stop")
+
+    # ============================================================
+    # Захват / кодирование
+    # ============================================================
+
     def capture_loop(self):
         print("[PC-Stream] 🎥 Поток захвата запущен")
         dbg.log_event("pc.capture_loop_start", {"fps": FPS})
@@ -214,18 +298,17 @@ class WindowStreamer:
         last_log_time = time.time()
         frame_count = 0
         first_frame_logged = False
-        window_lost_logged = False
 
         while self.streaming:
             t0 = time.time()
 
             try:
                 if not self.hwnd or not win32gui.IsWindow(self.hwnd):
-                    if not window_lost_logged:
-                        print("[PC-Stream] ⚠️ Окно закрыто или потеряно")
+                    if not self._window_lost:
+                        print("[PC-Stream] ⚠️ Окно не выбрано, ожидание активного...")
                         dbg.log_event("pc.window_lost", {"hwnd": self.hwnd})
-                        window_lost_logged = True
-                    time.sleep(0.5)
+                        self._window_lost = True
+                    time.sleep(0.1)
                     continue
 
                 with dbg.timer("pc.capture_frame"):
@@ -236,7 +319,9 @@ class WindowStreamer:
                         print("[PC-Stream] ✅ Первый кадр захвачен")
                         dbg.log_event("pc.first_frame_captured")
                         first_frame_logged = True
-                        window_lost_logged = False
+
+                    if self._window_lost:
+                        self._window_lost = False
 
                     if self.raw_frame_queue.full():
                         try:
@@ -252,7 +337,6 @@ class WindowStreamer:
 
                     if time.time() - last_log_time >= 5:
                         fps = frame_count / (time.time() - last_log_time)
-                        # print убран, чтобы не спамить в консоль
                         dbg.log_event("pc.capture_fps", {"fps": round(fps, 2)})
                         frame_count = 0
                         last_log_time = time.time()
@@ -300,7 +384,6 @@ class WindowStreamer:
 
                     if time.time() - last_log_time >= 5:
                         fps = encode_count / (time.time() - last_log_time)
-                        # print убран, чтобы не спамить в консоль
                         dbg.log_event("pc.encode_fps", {"fps": round(fps, 2)})
                         encode_count = 0
                         last_log_time = time.time()
@@ -310,6 +393,10 @@ class WindowStreamer:
 
         print("[PC-Stream] 🖼️ Поток кодирования остановлен")
         dbg.log_event("pc.encode_loop_stop")
+
+    # ============================================================
+    # HTTP-сервер
+    # ============================================================
 
     def start_http_server(self):
         parent = self
@@ -433,10 +520,11 @@ class WindowStreamer:
 </body>
 </html>"""
 
+    # ============================================================
+    # ADB reverse
+    # ============================================================
+
     def setup_adb_reverse(self):
-        """
-        Настраивает ADB reverse и ПРОВЕРЯЕТ, что он применился.
-        """
         ports = (PC_TO_PHONE_PORT, PC_OCR_PORT, PC_DEBUG_PORT)
         print(f"[PC-Stream] 🔗 Настройка ADB reverse: " +
               ", ".join(f"tcp:{p}" for p in ports))
@@ -451,7 +539,6 @@ class WindowStreamer:
             dbg.log_event("pc.adb_reverse_error", {"reason": "wifi"})
             return False
 
-        # Убеждаемся, что ADB-демон запущен
         try:
             print("[PC-Stream] 🔄 Запуск ADB-демона...")
             subprocess.run(
@@ -464,7 +551,6 @@ class WindowStreamer:
             print(f"[PC-Stream] ⚠️ Не удалось запустить ADB-демон: {e}")
 
         try:
-            # Удаляем старые reverse (если есть)
             for port in ports:
                 subprocess.run(
                     ["adb", "-s", self.selected_device, "reverse",
@@ -474,7 +560,6 @@ class WindowStreamer:
                     if sys.platform == "win32" else 0
                 )
 
-            # Настраиваем новые
             ok_all = True
             for port in ports:
                 with dbg.timer("pc.adb_reverse_setup", {"port": port}):
@@ -494,7 +579,6 @@ class WindowStreamer:
                                   {"port": port, "stderr": result.stderr})
                     ok_all = False
 
-            # ПРОВЕРКА: запрашиваем список reverse
             print("[PC-Stream] 🔍 Проверка ADB reverse --list...")
             try:
                 check = subprocess.run(
@@ -513,10 +597,6 @@ class WindowStreamer:
                             print(f"[PC-Stream] ⚠️ ВНИМАНИЕ: настроено {len(lines)} из {len(ports)} reverse!")
                     else:
                         print("[PC-Stream] ❌ ADB reverse --list пуст! Reverse не применился!")
-                        print("[PC-Stream]    Возможные причины:")
-                        print("[PC-Stream]    - Старая версия ADB (обновите Platform Tools)")
-                        print("[PC-Stream]    - ADB-демон падает")
-                        print("[PC-Stream]    - Устройство не поддерживает reverse")
                         ok_all = False
                 else:
                     print(f"[PC-Stream] ⚠️ Не удалось выполнить reverse --list: "
@@ -546,10 +626,6 @@ class WindowStreamer:
             pass
 
     def check_adb_reverse(self) -> str:
-        """
-        Возвращает строку с текущим списком ADB reverse.
-        Используется для диагностики (без UI-кнопки).
-        """
         if not self.selected_device:
             return "Устройство не выбрано"
         try:
@@ -568,21 +644,34 @@ class WindowStreamer:
         except Exception as e:
             return f"Ошибка: {e}"
 
+    # ============================================================
+    # Запуск / остановка
+    # ============================================================
+
     def start(self):
         if self.streaming:
             print("[PC-Stream] ⚠️ Стример уже запущен")
             return False
 
-        if not self.hwnd:
-            print("[PC-Stream] ❌ Окно не установлено")
-            return False
+        # Определяем стартовое активное окно (может не быть — тогда ждём)
+        our = self._get_our_hwnds()
+        fg = window_utils.get_foreground_window(our_hwnds=our)
+        if fg is not None:
+            try:
+                title = win32gui.GetWindowText(fg)
+            except Exception:
+                title = "?"
+            self.hwnd = fg
+            self.window_title = title
+            print(f"[PC-Stream] ▶ Стартовое активное окно: {title}")
+            dbg.log_event("pc.stream_start", {"hwnd": fg, "title": title})
+        else:
+            self.hwnd = None
+            self.window_title = None
+            print("[PC-Stream] ⏳ Активное окно не найдено — ждём появления...")
+            dbg.log_event("pc.stream_start_waiting")
 
-        if not win32gui.IsWindow(self.hwnd):
-            print("[PC-Stream] ❌ Окно не существует")
-            return False
-
-        print(f"[PC-Stream] ▶ Запуск трансляции: {self.window_title}")
-        dbg.log_event("pc.stream_start", {"hwnd": self.hwnd, "title": self.window_title})
+        self._window_lost = False
 
         with dbg.timer("pc.stream_start_total"):
             if not self.start_http_server():
@@ -596,21 +685,31 @@ class WindowStreamer:
             self.encode_thread = threading.Thread(target=self.encode_loop, daemon=True)
             self.encode_thread.start()
 
+            self.window_watcher_thread = threading.Thread(
+                target=self.window_watcher_loop, daemon=True
+            )
+            self.window_watcher_thread.start()
+
+            # Ждём первый кадр, но НЕ падаем, если его нет —
+            # просто продолжаем работу, кадр появится позже.
             print("[PC-Stream] ⏳ Ожидание первого кадра...")
+            got_first = False
             for _ in range(FIRST_FRAME_TIMEOUT * 10):
                 with self.frame_lock:
                     if self.current_frame_jpeg is not None:
+                        got_first = True
                         break
                 time.sleep(0.1)
 
-            with self.frame_lock:
-                if self.current_frame_jpeg is None:
-                    print(f"[PC-Stream] ❌ Первый кадр не получен")
-                    dbg.log_event("pc.first_frame_timeout")
-                    self.streaming = False
-                    return False
+            if got_first:
+                print("[PC-Stream] ✅ Первый кадр получен")
+            else:
+                print("[PC-Stream] ⚠️ Первый кадр не получен за "
+                      f"{FIRST_FRAME_TIMEOUT}с — продолжаем в режиме ожидания")
+                dbg.log_event("pc.first_frame_timeout_but_running")
 
-            print("[PC-Stream] ✅ Первый кадр получен")
+            # ADB reverse настраиваем в любом случае — телефон может
+            # подключиться и ждать кадров.
             self.setup_adb_reverse()
         return True
 
@@ -633,6 +732,13 @@ class WindowStreamer:
             except Exception:
                 pass
             self.encode_thread = None
+
+        if self.window_watcher_thread:
+            try:
+                self.window_watcher_thread.join(timeout=1)
+            except Exception:
+                pass
+            self.window_watcher_thread = None
 
         self._release_gdi()
 
