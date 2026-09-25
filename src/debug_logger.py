@@ -6,6 +6,11 @@
 - log_timing(stage, duration_ms, extra) — запись тайминга
 - timer(stage, extra) — контекстный менеджер
 - Агрегация таймингов по окну (avg/min/max/count/p95) при DEBUG_VERBOSE=False
+
+ИЗМЕНЕНО:
+  - Добавлен фильтр DEBUG_LOG_SKIP_STAGES — частые технические
+    события (pc.capture_frame, pc.encode_*) НЕ пишутся в лог.
+  - Окно агрегации увеличено с 1.0 до 5.0 сек (см. config.py).
 """
 
 import json
@@ -21,7 +26,13 @@ from src.config import (
     DEBUG_LOG_MAX_BYTES,
     DEBUG_VERBOSE,
     DEBUG_AGGREGATE_WINDOW_SEC,
+    DEBUG_LOG_SKIP_STAGES,
 )
+
+
+def _should_skip(stage: str) -> bool:
+    """Проверяет, нужно ли пропустить запись для данного stage."""
+    return stage in DEBUG_LOG_SKIP_STAGES
 
 
 class _Aggregator:
@@ -33,6 +44,8 @@ class _Aggregator:
         self._last_flush = time.time()
 
     def add(self, stage: str, duration_ms: float, extra: Optional[Dict[str, Any]] = None):
+        if _should_skip(stage):
+            return
         with self._lock:
             self._buckets[stage].append((duration_ms, extra or {}))
 
@@ -112,6 +125,10 @@ class DebugLogger:
     def _write_raw(self, record: Dict[str, Any]):
         if not DEBUG_LOG_ENABLED:
             return
+        # ИЗМЕНЕНО: фильтр по stage — не пишем частые технические события
+        stage = record.get("stage", "")
+        if _should_skip(stage):
+            return
         try:
             line = json.dumps(record, ensure_ascii=False)
             with self._lock:
@@ -122,6 +139,8 @@ class DebugLogger:
             pass
 
     def log_event(self, stage: str, data: Optional[Dict[str, Any]] = None, source: str = "pc"):
+        if _should_skip(stage):
+            return
         self._write_raw({
             "ts": time.time(),
             "source": source,
@@ -131,6 +150,8 @@ class DebugLogger:
         })
 
     def log_timing(self, stage: str, duration_ms: float, extra: Optional[Dict[str, Any]] = None, source: str = "pc"):
+        if _should_skip(stage):
+            return
         if DEBUG_VERBOSE:
             self._write_raw({
                 "ts": time.time(),
@@ -160,12 +181,16 @@ class Timer:
         self._extra = extra or {}
         self._source = source
         self._start = 0.0
+        self._skip = _should_skip(stage)
 
     def __enter__(self):
-        self._start = time.perf_counter()
+        if not self._skip:
+            self._start = time.perf_counter()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._skip:
+            return False
         duration_ms = (time.perf_counter() - self._start) * 1000.0
         self._logger.log_timing(self._stage, duration_ms, self._extra, self._source)
         return False
