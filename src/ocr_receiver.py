@@ -2,6 +2,10 @@
 """HTTP-сервер, принимает OCR-результаты от Android-приложения.
 
 Плюс отдельный HTTP-сервер на PC_DEBUG_PORT для debug-метрик.
+
+ИЗМЕНЕНО:
+  - DebugReceiver фильтрует частые Android-стадии (_ANDROID_SKIP_STAGES),
+    чтобы debug_timing.jsonl не раздувался.
 """
 
 import hashlib
@@ -16,12 +20,34 @@ from src.config import (
 )
 from src.debug_logger import logger as dbg
 
+# ИЗМЕНЕНО: список Android-стадий, которые НЕ пишутся в debug_timing.jsonl.
+# Это частые технические события (агрегаты каждую секунду), от которых
+# лог раздувается до десятков MB.
+_ANDROID_SKIP_STAGES = {
+    # MJPEG
+    "android.mjpeg_read_body",
+    "android.mjpeg_frame_size_kb",
+    "android.mjpeg_connect",
+    "android.mjpeg_connect_attempt",
+    # OCR (детали)
+    "android.pc_ocr_decode",
+    "android.ocr_pass1_blocks",
+    "android.ocr_pass2_blocks",
+    "android.ocr_pass2_skipped",
+    "android.ocr_pass2",
+    # HTTP-отправка на ПК
+    "android.ocr_sender_build_json",
+    "android.ocr_sender_http",
+}
+
+
+def _should_skip_android(stage: str) -> bool:
+    """Проверяет, нужно ли пропустить Android-запись для данного stage."""
+    return stage in _ANDROID_SKIP_STAGES
+
 
 def _blocks_fingerprint(blocks) -> str:
-    """
-    Возвращает хэш содержимого блоков: текст + координаты + confidence.
-    Используется для определения, изменился ли OCR-результат.
-    """
+    """Возвращает хэш содержимого блоков."""
     h = hashlib.md5()
     for b in blocks:
         h.update(str(b.get('text', '')).encode('utf-8', errors='ignore'))
@@ -52,16 +78,13 @@ class OcrReceiver:
         self.last_mode = "translate"
         self.last_alpha = 217
 
-        # Отпечаток предыдущих блоков — чтобы не обновлять timestamp
-        # при идентичном контенте.
         self._last_fingerprint = None
         self._last_mode_for_fp = None
         self._last_alpha_for_fp = None
 
-        # Счётчики
         self._request_count = 0
-        self._accepted_count = 0  # пришли новые данные
-        self._skipped_count = 0  # данные идентичны
+        self._accepted_count = 0
+        self._skipped_count = 0
 
     def start(self, port=PC_OCR_PORT):
         if self.running:
@@ -87,14 +110,12 @@ class OcrReceiver:
                     blocks = data.get('blocks', [])
                     fw = int(data.get('frame_width', 0))
                     fh = int(data.get('frame_height', 0))
-                    # ИЗМЕНЕНО: поддерживаем режим "ocr" (сырой OCR без перевода).
                     mode = data.get('mode', 'translate')
                     alpha = int(data.get('overlay_alpha', 217))
                     ts = time.time()
 
                     parent._request_count += 1
 
-                    # Проверяем, изменились ли блоки
                     fp = _blocks_fingerprint(blocks)
                     with parent.blocks_lock:
                         same = (
@@ -105,8 +126,6 @@ class OcrReceiver:
                         )
 
                         if same:
-                            # Идентичный результат — не обновляем
-                            # last_received_ts и не триггерим перерисовку.
                             parent._skipped_count += 1
                             if parent._request_count % 50 == 0:
                                 print(
@@ -196,13 +215,19 @@ class OcrReceiver:
 
 
 class DebugReceiver:
-    """Отдельный HTTP-сервер для приёма debug-метрик от Android."""
+    """Отдельный HTTP-сервер для приёма debug-метрик от Android.
+
+    ИЗМЕНЕНО: фильтрует частые Android-стадии (_ANDROID_SKIP_STAGES),
+    чтобы debug_timing.jsonl не раздувался.
+    """
 
     def __init__(self):
         self.server = None
         self.server_thread = None
         self.running = False
         self._request_count = 0
+        self._skipped_count = 0
+        self._accepted_count = 0
 
     def start(self, port=PC_DEBUG_PORT):
         if self.running:
@@ -219,19 +244,28 @@ class DebugReceiver:
                     if isinstance(records, dict):
                         records = [records]
                     n = 0
+                    skipped = 0
                     for rec in records:
                         if not isinstance(rec, dict):
+                            continue
+                        # ИЗМЕНЕНО: фильтр Android-стадий
+                        stage = rec.get("stage", "")
+                        if _should_skip_android(stage):
+                            skipped += 1
                             continue
                         rec["source"] = "android"
                         dbg._write_raw(rec)
                         n += 1
                     parent._request_count += 1
+                    parent._skipped_count += skipped
+                    parent._accepted_count += n
                     if parent._request_count % 10 == 1:
-                        print(f"[Debug-Receiver] 📥 POST /debug: {n} records")
+                        print(f"[Debug-Receiver] 📥 POST /debug: "
+                              f"{n} records (skipped {skipped})")
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
                     self.end_headers()
-                    self.wfile.write(f'{{"ok":true,"n":{n}}}'.encode())
+                    self.wfile.write(f'{{"ok":true,"n":{n},"skipped":{skipped}}}'.encode())
                 except Exception as e:
                     dbg.log_event("pc.debug_receive_error", {"error": str(e)})
                     self.send_error(500)
@@ -265,5 +299,8 @@ class DebugReceiver:
         self.server = None
         self.server_thread = None
         self.running = False
-        print("[Debug-Receiver] 👋 HTTP-сервер остановлен")
-        dbg.log_event("pc.debug_server_stopped")
+        print(f"[Debug-Receiver] 👋 HTTP-сервер остановлен "
+              f"(принято {self._accepted_count}, пропущено {self._skipped_count})")
+        dbg.log_event("pc.debug_server_stopped",
+                      {"accepted": self._accepted_count,
+                       "skipped": self._skipped_count})
