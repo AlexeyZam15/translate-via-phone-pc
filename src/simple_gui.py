@@ -4,10 +4,6 @@
 Трансляция всегда идёт с активного (foreground) окна Windows.
 Диалог выбора окна убран. При смене активного окна трансляция
 переключается автоматически без перезапуска потоков.
-
-Если на момент старта нет подходящего активного окна — стример
-запускается в режиме ожидания и подхватывает окно, как только оно
-появится.
 """
 
 import time
@@ -18,6 +14,7 @@ from tkinter import scrolledtext
 from src.pc_streamer import WindowStreamer
 from src.ocr_receiver import OcrReceiver, DebugReceiver
 from src.ocr_overlay import OcrOverlayWindow
+from src.translate_server import TranslateServer
 from src import adb_utils
 from src.debug_logger import logger as dbg
 
@@ -38,6 +35,7 @@ class SimplePhoneTranslator:
         self.ocr_receiver = None
         self.debug_receiver = None
         self.ocr_overlay = None
+        self.translate_server = None
 
         self._help_window = None
 
@@ -261,10 +259,6 @@ class SimplePhoneTranslator:
         self._do_start_streaming()
 
     def _get_our_hwnds(self):
-        """
-        Возвращает список HWND наших окон (главное окно + окно оверлея),
-        которые нельзя захватывать.
-        """
         hwnds = []
         try:
             hwnds.append(int(self.root.winfo_id()))
@@ -278,7 +272,6 @@ class SimplePhoneTranslator:
         return hwnds
 
     def on_hwnd_changed(self, hwnd, title):
-        """Callback от WindowStreamer при смене активного окна."""
         try:
             short = title if len(title) <= 40 else title[:37] + "..."
             self.window_status.config(text=f"🟢 Окно: {short}")
@@ -312,17 +305,21 @@ class SimplePhoneTranslator:
                 self.log("⚠️ Debug-сервер не запустился")
                 self.debug_receiver = None
 
-            # 3. MJPEG-стример (порт 5005) — сам определит активное окно
+            # 3. Translate-сервер (порт 5008) — CTranslate2
+            self.translate_server = TranslateServer()
+            if not self.translate_server.start():
+                self.log("⚠️ Translate-сервер не запустился (CTranslate2 недоступен)")
+                self.translate_server = None
+
+            # 4. MJPEG-стример (порт 5005)
             self.pc_streamer = WindowStreamer()
             self.pc_streamer.set_device(self.selected_device)
 
-            # Передаём список наших окон, чтобы их не захватывал
             our_hwnds = self._get_our_hwnds()
             self.pc_streamer.set_our_hwnds(our_hwnds)
             self.pc_streamer.set_on_hwnd_changed(self.on_hwnd_changed)
 
-            # 4. Прозрачный ОВЕРЛЕЙ — создаём с target_hwnd=0 (невидим),
-            #    потом set_target_hwnd() при первом появлении активного окна.
+            # 5. Прозрачный ОВЕРЛЕЙ
             self.ocr_overlay = OcrOverlayWindow(
                 self.root,
                 self.ocr_receiver,
@@ -330,25 +327,21 @@ class SimplePhoneTranslator:
                 pc_streamer=self.pc_streamer,
                 on_close=self.on_overlay_closed
             )
-            # Обновляем список наших HWND с учётом оверлея
             our_hwnds = self._get_our_hwnds()
             self.pc_streamer.set_our_hwnds(our_hwnds)
 
-            # 5. Запускаем стример в отдельном потоке
+            # 6. Запуск стримера в отдельном потоке
             def _start_streamer():
                 ok = self.pc_streamer.start()
                 if not ok:
                     self.root.after(0, self._on_streamer_start_failed)
                 else:
-                    # После успешного старта — если стартовое окно было,
-                    # синхронизируем target_hwnd оверлея.
                     try:
                         hwnd = self.pc_streamer.hwnd
                         title = self.pc_streamer.window_title or "?"
                         if hwnd:
                             self.root.after(0, lambda: self.on_hwnd_changed(hwnd, title))
                         else:
-                            # Окна не было — ждём, watcher подхватит.
                             self.root.after(0, lambda: self.window_status.config(
                                 text="🪟 Окно: ожидание активного..."
                             ))
@@ -360,7 +353,8 @@ class SimplePhoneTranslator:
             self.log("🚀 Запуск трансляции активного окна...")
             self.log(f"📱 Устройство: {self.selected_device}")
             self.log("ℹ️ Запустите Android-приложение и нажмите 'Старт OCR ПК'")
-            self.log("ℹ️ Трансляция автоматически переключается на активное окно")
+            # ИЗМЕНЕНО: текст про Translate-сервер
+            self.log("ℹ️ Translate-сервер: порт 5008 (CTranslate2 + Opus-MT)")
 
             dbg.log_event("pc.simple_gui_stream_started")
 
@@ -387,6 +381,13 @@ class SimplePhoneTranslator:
             except Exception:
                 pass
             self.pc_streamer = None
+
+        if self.translate_server:
+            try:
+                self.translate_server.stop()
+            except Exception:
+                pass
+            self.translate_server = None
 
         if self.debug_receiver:
             try:
@@ -583,7 +584,7 @@ class SimplePhoneTranslator:
             ("", ""),
             ("", "1. Проверьте ADB reverse во время трансляции (в отдельном окне):"),
             ("===CODE===", "adb reverse --list"),
-            ("", "Должно быть 3 записи (tcp:5005, tcp:5006, tcp:5007)."),
+            ("", "Должно быть 4 записи (tcp:5005, tcp:5006, tcp:5007, tcp:5008)."),
             ("===WARN===", "Если пусто — ADB reverse не работает. Обновите Platform Tools."),
             ("", ""),
             ("", "2. Проверьте логи Android-приложения:"),
@@ -592,6 +593,7 @@ class SimplePhoneTranslator:
             ("", ""),
             ("", "3. В логе ПК должны быть строки:"),
             ("===CODE===", "[PC-Stream] 📡 MJPEG client connected: ..."),
+            ("===CODE===", "[Translate-Server] 📥 #1: ... engine=ctranslate2"),
             ("===CODE===", "[OCR-Receiver] 📥 POST /ocr #1: ..."),
             ("", "Если их нет — Android не подключается к ПК."),
             ("", ""),

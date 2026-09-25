@@ -15,7 +15,9 @@ try:
 except ImportError:
     psutil = None
 
-# Заголовки, которые нужно исключить (наши окна)
+# Заголовки, которые нужно исключить (наши окна).
+# ИЗМЕНЕНО: сравнение теперь по подстроке (см. _check_window),
+# поэтому "Translate via Phone (Не отвечает)" тоже отфильтруется.
 EXCLUDED_TITLES = {
     "Simple Phone Translator",
     "Translate via Phone",
@@ -25,7 +27,7 @@ EXCLUDED_TITLES = {
     "Tk",
 }
 
-# Классы окон, которые нельзя захватывать (рабочий стол, панель задач, консоли)
+# Классы окон, которые нельзя захватывать
 EXCLUDED_CLASSES = {
     "Progman",
     "WorkerW",
@@ -33,13 +35,12 @@ EXCLUDED_CLASSES = {
     "SysListView32",
     "TaskManagerWindow",
     "MultitaskingViewFrame",
-    # Консольные окна
-    "ConsoleWindowClass",  # cmd.exe, PowerShell (классическая консоль)
-    "PseudoConsoleWindow",  # Windows Terminal (новый)
-    "CASCADIA_HOSTING_WINDOW_CLASS",  # Windows Terminal
+    "ConsoleWindowClass",
+    "PseudoConsoleWindow",
+    "CASCADIA_HOSTING_WINDOW_CLASS",
 }
 
-# Процессы, окна которых нельзя захватывать (консоли и интерпретаторы)
+# Процессы, окна которых нельзя захватывать
 EXCLUDED_PROCESSES = {
     "cmd.exe",
     "powershell.exe",
@@ -52,45 +53,33 @@ EXCLUDED_PROCESSES = {
     "pythonw.exe",
 }
 
-# Кэш имён процессов (pid -> name)
 _process_name_cache = {}
 
 
 def get_process_name_by_hwnd(hwnd: int, default: str = "?") -> str:
-    """
-    Возвращает имя процесса (exe) по HWND.
-    """
     if not hwnd or not win32gui.IsWindow(hwnd):
         return default
-
     try:
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         if not pid or pid <= 0:
             return default
     except Exception:
         return default
-
     if pid in _process_name_cache:
         return _process_name_cache[pid]
-
     name = _get_process_name_by_pid(pid)
-
     if name != default:
         _process_name_cache[pid] = name
-
     return name
 
 
 def _get_process_name_by_pid(pid: int) -> str:
-    """Возвращает имя процесса по PID, используя несколько способов."""
-
     if psutil is not None:
         try:
             proc = psutil.Process(pid)
             return proc.name()
         except Exception:
             pass
-
     try:
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         process_handle = win32api.OpenProcess(
@@ -109,7 +98,6 @@ def _get_process_name_by_pid(pid: int) -> str:
                 win32api.CloseHandle(process_handle)
     except Exception:
         pass
-
     try:
         PROCESS_QUERY_INFORMATION = 0x0400
         PROCESS_VM_READ = 0x0010
@@ -125,7 +113,6 @@ def _get_process_name_by_pid(pid: int) -> str:
                 win32api.CloseHandle(process_handle)
     except Exception:
         pass
-
     try:
         TH32CS_SNAPPROCESS = 0x00000002
         snapshot = win32api.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
@@ -140,19 +127,12 @@ def _get_process_name_by_pid(pid: int) -> str:
                 win32api.CloseHandle(snapshot)
     except Exception:
         pass
-
     return "?"
 
 
 def _check_window(hwnd: int, our_hwnds):
-    """
-    Проверяет, подходит ли окно для захвата.
-    Возвращает (ok: bool, reason: str).
-    reason — причина отказа (пустая строка, если ok).
-    """
     if not hwnd:
         return False, "hwnd=0"
-
     try:
         if not win32gui.IsWindow(hwnd):
             return False, "not a window"
@@ -182,8 +162,12 @@ def _check_window(hwnd: int, our_hwnds):
     if not title or len(title) < 1:
         return False, "no title"
 
-    if title in EXCLUDED_TITLES:
-        return False, f"excluded title: {title!r}"
+    # ИЗМЕНЕНО: сравнение по подстроке (без учёта регистра),
+    # чтобы отфильтровать "Translate via Phone (Не отвечает)" и подобные.
+    title_lower = title.lower()
+    for excluded in EXCLUDED_TITLES:
+        if excluded.lower() in title_lower:
+            return False, f"excluded title: {title!r}"
 
     try:
         class_name = win32gui.GetClassName(hwnd)
@@ -193,7 +177,6 @@ def _check_window(hwnd: int, our_hwnds):
     if class_name in EXCLUDED_CLASSES:
         return False, f"excluded class: {class_name!r}"
 
-    # Проверяем процесс — исключаем консоли и интерпретаторы
     try:
         process = get_process_name_by_hwnd(hwnd, default="?")
         if process.lower() in EXCLUDED_PROCESSES:
@@ -215,17 +198,6 @@ def _check_window(hwnd: int, our_hwnds):
 
 
 def get_foreground_window(our_hwnds=None):
-    """
-    Возвращает HWND активного (foreground) окна, если оно подходит
-    для захвата. Иначе — None. Логирует причину отказа.
-
-    Args:
-        our_hwnds: список HWND наших окон (главное окно, оверлей),
-                   которые нельзя захватывать.
-
-    Returns:
-        HWND или None.
-    """
     try:
         hwnd = win32gui.GetForegroundWindow()
     except Exception as e:
@@ -237,7 +209,6 @@ def get_foreground_window(our_hwnds=None):
 
     ok, reason = _check_window(hwnd, our_hwnds)
     if not ok:
-        # Логируем причину только если окно не наше (не спамим на своих)
         try:
             title = win32gui.GetWindowText(hwnd)
         except Exception:
@@ -253,10 +224,6 @@ def get_foreground_window(our_hwnds=None):
 
 
 def get_active_windows(our_hwnd: int = None):
-    """
-    Возвращает список видимых окон с заголовками.
-    Оставлена для совместимости (может использоваться в отладке).
-    """
     windows = []
     our = [our_hwnd] if our_hwnd else None
 
@@ -265,13 +232,11 @@ def get_active_windows(our_hwnd: int = None):
             ok, _reason = _check_window(hwnd, our)
             if not ok:
                 return True
-
             title = win32gui.GetWindowText(hwnd)
             rect = win32gui.GetWindowRect(hwnd)
             width = rect[2] - rect[0]
             height = rect[3] - rect[1]
             process = get_process_name_by_hwnd(hwnd, default="?")
-
             windows.append({
                 'hwnd': hwnd,
                 'title': title,
@@ -284,6 +249,5 @@ def get_active_windows(our_hwnd: int = None):
         return True
 
     win32gui.EnumWindows(enum_callback, None)
-
     windows.sort(key=lambda w: (w['process'].lower(), w['title'].lower()))
     return windows

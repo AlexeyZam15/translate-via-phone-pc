@@ -1,17 +1,16 @@
 # src/pc_streamer.py
 """Захват активного окна Windows через PrintWindow + MJPEG + ADB reverse.
 
-Трансляция автоматически переключается на активное (foreground) окно.
-При смене окна НЕ перезапускает потоки — просто меняет HWND.
-
-Если на момент старта нет подходящего активного окна — стример
-запускается в режиме ожидания и подхватывает окно, как только оно
-появится (через window_watcher_loop).
+ИЗМЕНЕНО:
+  - set_active_hwnd НЕ сбрасывает current_frame_jpeg (клиент видит старый кадр).
+  - MJPEG-стрим ловит ConnectionAbortedError/ConnectionResetError/BrokenPipeError.
+  - SO_KEEPALIVE + TCP_NODELAY для HTTP-сервера.
 """
 
 import cv2
 import numpy as np
 import ctypes
+import socket
 import threading
 import time
 import queue
@@ -27,6 +26,7 @@ from src.config import (
     PC_TO_PHONE_PORT,
     PC_OCR_PORT,
     PC_DEBUG_PORT,
+    PC_TRANSLATE_PORT,
     FPS,
     JPEG_QUALITY,
     MAX_STREAM_WIDTH,
@@ -35,7 +35,6 @@ from src.config import (
 from src.debug_logger import logger as dbg
 from src import window_utils
 
-# Интервал опроса активного окна (сек)
 WINDOW_WATCH_INTERVAL = 0.3
 
 
@@ -51,11 +50,9 @@ class WindowStreamer:
         self.server = None
         self.server_thread = None
 
-        # HWND наших окон (главное окно приложения, оверлей) — их нельзя захватывать
         self._our_hwnds = []
         self._our_hwnds_lock = threading.Lock()
 
-        # Callback при смене активного окна
         self._on_hwnd_changed = None
 
         self._gdi = {
@@ -78,7 +75,6 @@ class WindowStreamer:
         self.encode_thread = None
         self.window_watcher_thread = None
 
-        # Флаг, что текущее окно было закрыто (чтобы не спамить лог)
         self._window_lost = False
 
     # ============================================================
@@ -86,12 +82,10 @@ class WindowStreamer:
     # ============================================================
 
     def set_our_hwnds(self, hwnds):
-        """Устанавливает список HWND наших окон (не захватывать)."""
         with self._our_hwnds_lock:
             self._our_hwnds = [h for h in hwnds if h]
 
     def set_on_hwnd_changed(self, callback):
-        """Устанавливает callback, вызываемый при смене активного окна."""
         self._on_hwnd_changed = callback
 
     def _get_our_hwnds(self):
@@ -99,16 +93,24 @@ class WindowStreamer:
             return list(self._our_hwnds)
 
     def set_active_hwnd(self, hwnd, title):
-        """
-        Меняет активное окно БЕЗ перезапуска потоков.
-        GDI пересоздастся автоматически в capture_loop.
-        """
+        """ИЗМЕНЕНО: не сбрасываем current_frame_jpeg — клиент видит старый кадр,
+        пока новый не будет захвачен. Это предотвращает таймаут MJPEG-клиента."""
         if hwnd == self.hwnd:
             return
         old = self.hwnd
         self.hwnd = hwnd
         self.window_title = title
         self._window_lost = False
+
+        # НЕ сбрасываем current_frame_jpeg — пусть клиент видит старый кадр
+        # до тех пор, пока не появится новый.
+
+        # Освобождаем GDI старого окна — новый создастся в capture_loop.
+        try:
+            self._release_gdi()
+        except Exception:
+            pass
+
         print(f"[PC-Stream] 🔄 Активное окно: {title} (HWND={hwnd}, было {old})")
         dbg.log_event("pc.window_changed", {"hwnd": hwnd, "title": title, "old": old})
         if self._on_hwnd_changed is not None:
@@ -402,6 +404,17 @@ class WindowStreamer:
         parent = self
 
         class MJPEGHandler(http.server.BaseHTTPRequestHandler):
+            def setup(self):
+                """ИЗМЕНЕНО: SO_KEEPALIVE + TCP_NODELAY для стабильного соединения."""
+                super().setup()
+                try:
+                    self.connection.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    self.connection.setsockopt(
+                        socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except Exception:
+                    pass
+
             def do_GET(self):
                 if self.path == '/' or self.path == '/index.html':
                     self.send_response(200)
@@ -423,18 +436,32 @@ class WindowStreamer:
                                      'no-cache, no-store, must-revalidate')
                     self.send_header('Pragma', 'no-cache')
                     self.send_header('Expires', '0')
+                    self.send_header('Connection', 'keep-alive')
                     self.end_headers()
 
                     last_counter = -1
                     sent_count = 0
                     t_last = time.time()
+                    empty_cycles = 0
                     try:
                         while parent.streaming:
                             with parent.frame_lock:
                                 jpeg = parent.current_frame_jpeg
                                 counter = parent.frame_counter
 
-                            if jpeg is None or counter == last_counter:
+                            # ИЗМЕНЕНО: если кадра нет — не рвём соединение,
+                            # ждём появления (до 30 сек).
+                            if jpeg is None:
+                                empty_cycles += 1
+                                if empty_cycles > 6000:  # 30 сек при sleep(0.005)
+                                    print("[PC-Stream] ⚠️ Нет кадров 30 сек, "
+                                          "закрываем MJPEG")
+                                    break
+                                time.sleep(0.005)
+                                continue
+                            empty_cycles = 0
+
+                            if counter == last_counter:
                                 time.sleep(0.005)
                                 continue
                             last_counter = counter
@@ -448,13 +475,24 @@ class WindowStreamer:
                                 self.wfile.write(jpeg)
                                 self.wfile.write(b'\r\n')
                                 sent_count += 1
-                            except (BrokenPipeError, ConnectionResetError):
+                            except (BrokenPipeError,
+                                    ConnectionResetError,
+                                    ConnectionAbortedError,
+                                    OSError) as e:
+                                # ИЗМЕНЕНО: ловим все сетевые ошибки,
+                                # не крашим стрим.
+                                print(f"[PC-Stream] ⚠️ MJPEG send error "
+                                      f"({type(e).__name__}): {e}")
+                                dbg.log_event("pc.mjpeg_send_error",
+                                              {"error": str(e),
+                                               "type": type(e).__name__})
                                 break
 
                             if time.time() - t_last >= 5:
                                 sent_count = 0
                                 t_last = time.time()
                     except Exception as e:
+                        # ИЗМЕНЕНО: не крашим, только логируем
                         print(f"[PC-Stream] ⚠️ MJPEG stream error: {e}")
                         dbg.log_event("pc.mjpeg_stream_error", {"error": str(e)})
                     finally:
@@ -525,7 +563,7 @@ class WindowStreamer:
     # ============================================================
 
     def setup_adb_reverse(self):
-        ports = (PC_TO_PHONE_PORT, PC_OCR_PORT, PC_DEBUG_PORT)
+        ports = (PC_TO_PHONE_PORT, PC_OCR_PORT, PC_DEBUG_PORT, PC_TRANSLATE_PORT)
         print(f"[PC-Stream] 🔗 Настройка ADB reverse: " +
               ", ".join(f"tcp:{p}" for p in ports))
 
@@ -613,7 +651,7 @@ class WindowStreamer:
     def remove_adb_reverse(self):
         try:
             if self.selected_device:
-                for port in (PC_TO_PHONE_PORT, PC_OCR_PORT, PC_DEBUG_PORT):
+                for port in (PC_TO_PHONE_PORT, PC_OCR_PORT, PC_DEBUG_PORT, PC_TRANSLATE_PORT):
                     subprocess.run(
                         ["adb", "-s", self.selected_device, "reverse",
                          "--remove", f"tcp:{port}"],
@@ -653,7 +691,6 @@ class WindowStreamer:
             print("[PC-Stream] ⚠️ Стример уже запущен")
             return False
 
-        # Определяем стартовое активное окно (может не быть — тогда ждём)
         our = self._get_our_hwnds()
         fg = window_utils.get_foreground_window(our_hwnds=our)
         if fg is not None:
@@ -690,8 +727,6 @@ class WindowStreamer:
             )
             self.window_watcher_thread.start()
 
-            # Ждём первый кадр, но НЕ падаем, если его нет —
-            # просто продолжаем работу, кадр появится позже.
             print("[PC-Stream] ⏳ Ожидание первого кадра...")
             got_first = False
             for _ in range(FIRST_FRAME_TIMEOUT * 10):
@@ -708,8 +743,6 @@ class WindowStreamer:
                       f"{FIRST_FRAME_TIMEOUT}с — продолжаем в режиме ожидания")
                 dbg.log_event("pc.first_frame_timeout_but_running")
 
-            # ADB reverse настраиваем в любом случае — телефон может
-            # подключиться и ждать кадров.
             self.setup_adb_reverse()
         return True
 

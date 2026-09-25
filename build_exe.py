@@ -3,6 +3,12 @@
 Сборка translate_via_phone в .exe (PyInstaller)
 
 Запуск: python build_exe.py
+
+ИЗМЕНЕНО:
+  - src.translate_server в hidden-imports.
+  - ctranslate2 + sentencepiece для HTTP-перевода (офлайн).
+  - Модель через --add-data=models;models.
+  - googletrans/argostranslate НЕ включены.
 """
 
 import PyInstaller.__main__
@@ -39,7 +45,7 @@ EXCLUDED_MODULES = [
     'jupyter', 'notebook', 'ipykernel', 'ipython',
     'nbconvert', 'nbformat',
     'django', 'flask', 'fastapi', 'tornado',
-    'aiohttp', 'requests', 'urllib3',
+    'aiohttp',
     'starlette', 'uvicorn',
     'sqlite3', 'psycopg2', 'mysql', 'pymongo', 'sqlalchemy',
     'cryptography', 'openssl', 'pycryptodome',
@@ -104,7 +110,7 @@ def build_exe():
         '--hidden-import=win32process',
         '--hidden-import=win32file',
 
-        # --- psutil (для определения имени процесса) ---
+        # --- psutil ---
         '--hidden-import=psutil',
 
         # --- OpenCV / numpy / Pillow ---
@@ -185,6 +191,11 @@ def build_exe():
         '--hidden-import=src.ocr_overlay',
         '--hidden-import=src.simple_gui',
         '--hidden-import=src.window_utils',
+        '--hidden-import=src.translate_server',
+
+        # --- HTTP-перевод (CTranslate2 + SentencePiece) ---
+        '--hidden-import=ctranslate2',
+        '--hidden-import=sentencepiece',
     ])
 
     args.extend([
@@ -194,7 +205,16 @@ def build_exe():
         '--collect-all=psutil',
         '--collect-submodules=src',
         '--collect-data=src',
+        '--collect-all=ctranslate2',
+        '--collect-all=sentencepiece',
     ])
+
+    models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+    if os.path.isdir(models_dir):
+        args.append(f'--add-data={models_dir};models')
+        print(f"✅ Модель добавлена: {models_dir}")
+    else:
+        print("⚠️  Папка models/ не найдена — HTTP-перевод не будет работать в exe")
 
     if os.path.exists(APP_ICON):
         args.append(f'--icon={APP_ICON}')

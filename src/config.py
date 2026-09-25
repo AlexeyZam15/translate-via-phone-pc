@@ -17,6 +17,8 @@ APP_DIR = _get_app_dir()
 PC_TO_PHONE_PORT = 5005  # MJPEG-поток на телефон
 PC_OCR_PORT = 5006  # Приём OCR-результатов от телефона
 PC_DEBUG_PORT = 5007  # Приём debug-метрик от телефона
+# ИЗМЕНЕНО: порт HTTP-сервера перевода (CTranslate2)
+PC_TRANSLATE_PORT = 5008
 
 # --- Параметры стрима ---
 FPS = 10
