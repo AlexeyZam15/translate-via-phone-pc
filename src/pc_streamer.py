@@ -5,6 +5,10 @@
   - set_active_hwnd НЕ сбрасывает current_frame_jpeg (клиент видит старый кадр).
   - MJPEG-стрим ловит ConnectionAbortedError/ConnectionResetError/BrokenPipeError.
   - SO_KEEPALIVE + TCP_NODELAY для HTTP-сервера.
+  - Добавлен порт PC_SETTINGS_PORT (5009) в ADB reverse.
+  - setup_adb_reverse теперь ПАРАЛЛЕЛЬНЫЙ.
+  - INTER_AREA вместо INTER_LINEAR — меньше артефактов на тексте
+    при уменьшении окна (важно для OCR).
 """
 
 import cv2
@@ -18,6 +22,7 @@ import http.server
 import socketserver
 import subprocess
 import sys
+import concurrent.futures
 
 import win32gui
 import win32ui
@@ -27,6 +32,7 @@ from src.config import (
     PC_OCR_PORT,
     PC_DEBUG_PORT,
     PC_TRANSLATE_PORT,
+    PC_SETTINGS_PORT,
     FPS,
     JPEG_QUALITY,
     MAX_STREAM_WIDTH,
@@ -94,7 +100,7 @@ class WindowStreamer:
 
     def set_active_hwnd(self, hwnd, title):
         """ИЗМЕНЕНО: не сбрасываем current_frame_jpeg — клиент видит старый кадр,
-        пока новый не будет захвачен. Это предотвращает таймаут MJPEG-клиента."""
+        пока новый не будет захвачен."""
         if hwnd == self.hwnd:
             return
         old = self.hwnd
@@ -102,10 +108,6 @@ class WindowStreamer:
         self.window_title = title
         self._window_lost = False
 
-        # НЕ сбрасываем current_frame_jpeg — пусть клиент видит старый кадр
-        # до тех пор, пока не появится новый.
-
-        # Освобождаем GDI старого окна — новый создастся в capture_loop.
         try:
             self._release_gdi()
         except Exception:
@@ -231,8 +233,9 @@ class WindowStreamer:
             scale = MAX_STREAM_WIDTH / w
             new_w = MAX_STREAM_WIDTH
             new_h = int(h * scale)
+            # ИЗМЕНЕНО: INTER_AREA — меньше артефактов на тексте
             frame = cv2.resize(frame, (new_w, new_h),
-                               interpolation=cv2.INTER_LINEAR)
+                               interpolation=cv2.INTER_AREA)
 
         return frame
 
@@ -258,8 +261,9 @@ class WindowStreamer:
                     scale = MAX_STREAM_WIDTH / w
                     new_w = MAX_STREAM_WIDTH
                     new_h = int(h * scale)
+                    # ИЗМЕНЕНО: INTER_AREA
                     frame = cv2.resize(frame, (new_w, new_h),
-                                       interpolation=cv2.INTER_LINEAR)
+                                       interpolation=cv2.INTER_AREA)
                 return frame
             finally:
                 win32gui.ReleaseDC(self.hwnd, hwnd_dc)
@@ -405,7 +409,6 @@ class WindowStreamer:
 
         class MJPEGHandler(http.server.BaseHTTPRequestHandler):
             def setup(self):
-                """ИЗМЕНЕНО: SO_KEEPALIVE + TCP_NODELAY для стабильного соединения."""
                 super().setup()
                 try:
                     self.connection.setsockopt(
@@ -449,11 +452,9 @@ class WindowStreamer:
                                 jpeg = parent.current_frame_jpeg
                                 counter = parent.frame_counter
 
-                            # ИЗМЕНЕНО: если кадра нет — не рвём соединение,
-                            # ждём появления (до 30 сек).
                             if jpeg is None:
                                 empty_cycles += 1
-                                if empty_cycles > 6000:  # 30 сек при sleep(0.005)
+                                if empty_cycles > 6000:
                                     print("[PC-Stream] ⚠️ Нет кадров 30 сек, "
                                           "закрываем MJPEG")
                                     break
@@ -479,8 +480,6 @@ class WindowStreamer:
                                     ConnectionResetError,
                                     ConnectionAbortedError,
                                     OSError) as e:
-                                # ИЗМЕНЕНО: ловим все сетевые ошибки,
-                                # не крашим стрим.
                                 print(f"[PC-Stream] ⚠️ MJPEG send error "
                                       f"({type(e).__name__}): {e}")
                                 dbg.log_event("pc.mjpeg_send_error",
@@ -492,7 +491,6 @@ class WindowStreamer:
                                 sent_count = 0
                                 t_last = time.time()
                     except Exception as e:
-                        # ИЗМЕНЕНО: не крашим, только логируем
                         print(f"[PC-Stream] ⚠️ MJPEG stream error: {e}")
                         dbg.log_event("pc.mjpeg_stream_error", {"error": str(e)})
                     finally:
@@ -563,7 +561,9 @@ class WindowStreamer:
     # ============================================================
 
     def setup_adb_reverse(self):
-        ports = (PC_TO_PHONE_PORT, PC_OCR_PORT, PC_DEBUG_PORT, PC_TRANSLATE_PORT)
+        """ИЗМЕНЕНО: параллельная настройка всех портов."""
+        ports = (PC_TO_PHONE_PORT, PC_OCR_PORT, PC_DEBUG_PORT,
+                 PC_TRANSLATE_PORT, PC_SETTINGS_PORT)
         print(f"[PC-Stream] 🔗 Настройка ADB reverse: " +
               ", ".join(f"tcp:{p}" for p in ports))
 
@@ -588,8 +588,8 @@ class WindowStreamer:
         except Exception as e:
             print(f"[PC-Stream] ⚠️ Не удалось запустить ADB-демон: {e}")
 
-        try:
-            for port in ports:
+        def _remove_one(port):
+            try:
                 subprocess.run(
                     ["adb", "-s", self.selected_device, "reverse",
                      "--remove", f"tcp:{port}"],
@@ -597,61 +597,79 @@ class WindowStreamer:
                     creationflags=subprocess.CREATE_NO_WINDOW
                     if sys.platform == "win32" else 0
                 )
+            except Exception:
+                pass
 
-            ok_all = True
-            for port in ports:
-                with dbg.timer("pc.adb_reverse_setup", {"port": port}):
-                    result = subprocess.run(
-                        ["adb", "-s", self.selected_device, "reverse",
-                         f"tcp:{port}", f"tcp:{port}"],
-                        capture_output=True, text=True, timeout=10,
-                        creationflags=subprocess.CREATE_NO_WINDOW
-                        if sys.platform == "win32" else 0
-                    )
-                if result.returncode == 0:
-                    print(f"[PC-Stream] ✅ ADB reverse tcp:{port} → tcp:{port}")
-                else:
-                    print(f"[PC-Stream] ❌ Ошибка ADB reverse tcp:{port}: "
-                          f"{result.stderr}")
-                    dbg.log_event("pc.adb_reverse_fail",
-                                  {"port": port, "stderr": result.stderr})
-                    ok_all = False
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+                list(ex.map(_remove_one, ports))
+        except Exception:
+            pass
 
-            print("[PC-Stream] 🔍 Проверка ADB reverse --list...")
+        def _setup_one(port):
             try:
-                check = subprocess.run(
-                    ["adb", "-s", self.selected_device, "reverse", "--list"],
-                    capture_output=True, text=True, timeout=5,
+                result = subprocess.run(
+                    ["adb", "-s", self.selected_device, "reverse",
+                     f"tcp:{port}", f"tcp:{port}"],
+                    capture_output=True, text=True, timeout=10,
                     creationflags=subprocess.CREATE_NO_WINDOW
                     if sys.platform == "win32" else 0
                 )
-                if check.returncode == 0:
-                    lines = [l for l in check.stdout.strip().split("\n") if l.strip()]
-                    if lines:
-                        print("[PC-Stream] 📋 ADB reverse --list:")
-                        for line in lines:
-                            print(f"[PC-Stream]    {line}")
-                        if len(lines) < len(ports):
-                            print(f"[PC-Stream] ⚠️ ВНИМАНИЕ: настроено {len(lines)} из {len(ports)} reverse!")
-                    else:
-                        print("[PC-Stream] ❌ ADB reverse --list пуст! Reverse не применился!")
-                        ok_all = False
-                else:
-                    print(f"[PC-Stream] ⚠️ Не удалось выполнить reverse --list: "
-                          f"{check.stderr}")
+                return port, result.returncode, result.stderr
             except Exception as e:
-                print(f"[PC-Stream] ⚠️ Ошибка проверки reverse --list: {e}")
+                return port, -1, str(e)
 
-            return ok_all
+        ok_all = True
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+                results = list(ex.map(_setup_one, ports))
+            for port, rc, err in results:
+                if rc == 0:
+                    print(f"[PC-Stream] ✅ ADB reverse tcp:{port} → tcp:{port}")
+                else:
+                    print(f"[PC-Stream] ❌ Ошибка ADB reverse tcp:{port}: {err}")
+                    dbg.log_event("pc.adb_reverse_fail",
+                                  {"port": port, "stderr": err})
+                    ok_all = False
         except Exception as e:
-            print(f"[PC-Stream] ❌ Ошибка ADB reverse: {e}")
+            print(f"[PC-Stream] ❌ Ошибка параллельного ADB reverse: {e}")
             dbg.log_event("pc.adb_reverse_exception", {"error": str(e)})
             return False
+
+        print("[PC-Stream] 🔍 Проверка ADB reverse --list...")
+        try:
+            check = subprocess.run(
+                ["adb", "-s", self.selected_device, "reverse", "--list"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW
+                if sys.platform == "win32" else 0
+            )
+            if check.returncode == 0:
+                lines = [l for l in check.stdout.strip().split("\n") if l.strip()]
+                if lines:
+                    print("[PC-Stream] 📋 ADB reverse --list:")
+                    for line in lines:
+                        print(f"[PC-Stream]    {line}")
+                    if len(lines) < len(ports):
+                        print(f"[PC-Stream] ⚠️ ВНИМАНИЕ: настроено "
+                              f"{len(lines)} из {len(ports)} reverse!")
+                else:
+                    print("[PC-Stream] ❌ ADB reverse --list пуст! "
+                          "Reverse не применился!")
+                    ok_all = False
+            else:
+                print(f"[PC-Stream] ⚠️ Не удалось выполнить reverse --list: "
+                      f"{check.stderr}")
+        except Exception as e:
+            print(f"[PC-Stream] ⚠️ Ошибка проверки reverse --list: {e}")
+
+        return ok_all
 
     def remove_adb_reverse(self):
         try:
             if self.selected_device:
-                for port in (PC_TO_PHONE_PORT, PC_OCR_PORT, PC_DEBUG_PORT, PC_TRANSLATE_PORT):
+                for port in (PC_TO_PHONE_PORT, PC_OCR_PORT, PC_DEBUG_PORT,
+                             PC_TRANSLATE_PORT, PC_SETTINGS_PORT):
                     subprocess.run(
                         ["adb", "-s", self.selected_device, "reverse",
                          "--remove", f"tcp:{port}"],

@@ -3,9 +3,11 @@
 
 ИЗМЕНЕНО:
   - Автонастройка intra_threads от физических ядер CPU.
-  - beam_size=1 (greedy) — самый быстрый режим.
+  - Параметры декодирования берутся из текущего профиля качества.
+  - Прогрев CTranslate2 при старте — первый реальный перевод быстрый.
   - Кэш переводов (dict + Lock, максимум 5000 записей).
-  - Single-threaded HTTPServer — нет конкуренции за CTranslate2.
+  - Single-threaded HTTPServer.
+  - Пары вход→выход пишутся в ocr_text.log (только при изменении).
 """
 
 import json
@@ -16,8 +18,14 @@ import time
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from src.config import PC_TRANSLATE_PORT, APP_DIR
+from src.config import (
+    PC_TRANSLATE_PORT,
+    APP_DIR,
+    TRANSLATE_PROFILE_CONFIGS,
+)
+from src.settings_manager import settings_manager
 from src.debug_logger import logger as dbg
+from src.text_logger import log_translate_text
 
 
 def _get_models_dir() -> str:
@@ -29,12 +37,6 @@ def _get_models_dir() -> str:
 
 
 def _get_optimal_threads() -> tuple:
-    """Возвращает (intra_threads, inter_threads) от параметров CPU.
-
-    Использует psutil.cpu_count(logical=False) — физические ядра.
-    Формула: intra_threads = max(2, int(physical_cores * 0.7)).
-    inter_threads = 1 (сервер single-threaded).
-    """
     try:
         import psutil
         physical = psutil.cpu_count(logical=False) or 4
@@ -46,14 +48,12 @@ def _get_optimal_threads() -> tuple:
     return intra, inter
 
 
-# Кэш движка
 _ct2_available = False
 _ct2_translator = None
 _sp_source = None
 _sp_target = None
 _ct2_lock = threading.Lock()
 
-# Кэш переводов
 _translation_cache = {}
 _cache_lock = threading.Lock()
 CACHE_MAX_SIZE = 5000
@@ -64,13 +64,16 @@ DEFAULT_TARGET = "ru"
 MODEL_DIR_NAME_ORIG = f"opus-mt-{DEFAULT_SOURCE}-{DEFAULT_TARGET}-ct2-int8-orig"
 MODEL_DIR_NAME_FALLBACK = f"opus-mt-{DEFAULT_SOURCE}-{DEFAULT_TARGET}-ct2-int8"
 
-# ИЗМЕНЕНО: самые быстрые опции CTranslate2
-BEAM_SIZE = 1
-MAX_DECODING_LENGTH = 192
-REPETITION_PENALTY = 1.15
-NO_REPEAT_NGRAM_SIZE = 3
-
 INTRA_THREADS, INTER_THREADS = _get_optimal_threads()
+
+
+def _get_profile_config():
+    profile = settings_manager.get("translate_profile", "speed")
+    cfg = TRANSLATE_PROFILE_CONFIGS.get(profile)
+    if cfg is None:
+        cfg = TRANSLATE_PROFILE_CONFIGS["speed"]
+        profile = "speed"
+    return profile, cfg
 
 
 def _check_model_dir(path: str) -> bool:
@@ -78,6 +81,29 @@ def _check_model_dir(path: str) -> bool:
     if not os.path.isdir(path):
         return False
     return all(os.path.exists(os.path.join(path, f)) for f in required)
+
+
+def _warmup_ctranslate2():
+    """Прогрев CTranslate2: фиктивный перевод, чтобы первый реальный
+    был быстрым."""
+    if not _ct2_available or _ct2_translator is None:
+        return
+    if _sp_source is None or _sp_target is None:
+        return
+    try:
+        t0 = time.perf_counter()
+        tokens = _sp_source.encode("hello world", out_type=str) + ["</s>"]
+        _ct2_translator.translate_batch(
+            [tokens],
+            beam_size=1, max_batch_size=1,
+            repetition_penalty=1.0, no_repeat_ngram_size=0,
+            max_decoding_length=16,
+        )
+        ms = (time.perf_counter() - t0) * 1000.0
+        print(f"[Translate-Server] ✅ CTranslate2 прогрет ({ms:.0f} мс)")
+        dbg.log_event("pc.translate_server_warmup", {"ms": round(ms, 1)})
+    except Exception as e:
+        print(f"[Translate-Server] ⚠️ Прогрев не удался: {e}")
 
 
 def _init_ctranslate2():
@@ -123,19 +149,22 @@ def _init_ctranslate2():
                 intra_threads=INTRA_THREADS,
             )
             _ct2_available = True
+            profile, cfg = _get_profile_config()
             print(f"[Translate-Server] ✅ CTranslate2 модель загружена: {os.path.basename(model_path)}")
-            print(f"[Translate-Server]    beam_size={BEAM_SIZE}, "
-                  f"intra_threads={INTRA_THREADS}, inter_threads={INTER_THREADS}, "
-                  f"max_dec_len={MAX_DECODING_LENGTH}, "
-                  f"rep_penalty={REPETITION_PENALTY}, "
-                  f"no_repeat_ngram={NO_REPEAT_NGRAM_SIZE}, "
-                  f"cache_max={CACHE_MAX_SIZE}")
+            print(f"[Translate-Server]    intra_threads={INTRA_THREADS}, "
+                  f"inter_threads={INTER_THREADS}, cache_max={CACHE_MAX_SIZE}")
+            print(f"[Translate-Server]    профиль по умолчанию: {profile} "
+                  f"(beam={cfg['beam_size']}, rep_pen={cfg['repetition_penalty']}, "
+                  f"no_repeat={cfg['no_repeat_ngram_size']}, "
+                  f"max_len={cfg['max_decoding_length']})")
             dbg.log_event("pc.translate_server_ct2_ok",
                           {"model": os.path.basename(model_path),
-                           "beam_size": BEAM_SIZE,
                            "intra_threads": INTRA_THREADS,
                            "inter_threads": INTER_THREADS,
+                           "default_profile": profile,
                            "cache_max": CACHE_MAX_SIZE})
+
+            _warmup_ctranslate2()
         except Exception as e:
             print(f"[Translate-Server] ❌ Ошибка загрузки модели: {e}")
             traceback.print_exc()
@@ -150,7 +179,6 @@ def _cache_get(key):
 def _cache_set(key, value):
     with _cache_lock:
         if len(_translation_cache) >= CACHE_MAX_SIZE:
-            # Простое LRU-подобное: удаляем первый элемент (FIFO)
             try:
                 _translation_cache.pop(next(iter(_translation_cache)))
             except Exception:
@@ -159,21 +187,25 @@ def _cache_set(key, value):
 
 
 def _translate_ct2(texts, source, target):
-    """Перевод через CTranslate2 с кэшем."""
     if not _ct2_available or _ct2_translator is None:
         return None
     if _sp_source is None or _sp_target is None:
         return None
 
     try:
-        # Проверяем кэш для каждого текста
+        profile, cfg = _get_profile_config()
+        beam_size = cfg["beam_size"]
+        rep_penalty = cfg["repetition_penalty"]
+        no_repeat = cfg["no_repeat_ngram_size"]
+        max_len = cfg["max_decoding_length"]
+
         results = [None] * len(texts)
-        to_translate = []  # (index, text)
+        to_translate = []
         for i, t in enumerate(texts):
             if not t or not t.strip():
                 results[i] = ""
                 continue
-            cache_key = (t, source, target)
+            cache_key = (t, source, target, profile)
             cached = _cache_get(cache_key)
             if cached is not None:
                 results[i] = cached
@@ -181,10 +213,8 @@ def _translate_ct2(texts, source, target):
                 to_translate.append((i, t))
 
         if not to_translate:
-            # Всё из кэша
             return results
 
-        # Переводим только новые
         tokenized = []
         for _, t in to_translate:
             tokens = _sp_source.encode(t, out_type=str) + ["</s>"]
@@ -192,19 +222,18 @@ def _translate_ct2(texts, source, target):
 
         ct_results = _ct2_translator.translate_batch(
             tokenized,
-            beam_size=BEAM_SIZE,
+            beam_size=beam_size,
             max_batch_size=16,
-            repetition_penalty=REPETITION_PENALTY,
-            no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
-            max_decoding_length=MAX_DECODING_LENGTH,
+            repetition_penalty=rep_penalty,
+            no_repeat_ngram_size=no_repeat,
+            max_decoding_length=max_len,
         )
 
         for (idx, orig_text), r in zip(to_translate, ct_results):
             hyp = r.hypotheses[0] if r.hypotheses else []
             decoded = _sp_target.decode(hyp)
             results[idx] = decoded
-            # Сохраняем в кэш
-            _cache_set((orig_text, source, target), decoded)
+            _cache_set((orig_text, source, target, profile), decoded)
 
         return results
     except Exception as e:
@@ -260,6 +289,8 @@ class TranslateServer:
                         self._send_json({"translations": [], "engine": "none"})
                         return
 
+                    profile, _ = _get_profile_config()
+
                     translations = _translate_ct2(texts, source, target)
                     engine = "ctranslate2"
                     if translations is None:
@@ -272,14 +303,21 @@ class TranslateServer:
                         with _cache_lock:
                             cache_size = len(_translation_cache)
                         print(f"[Translate-Server] 📥 #{parent._request_count}: "
-                              f"{len(texts)} texts, engine={engine}, {ms:.0f}ms, "
+                              f"{len(texts)} texts, engine={engine}, "
+                              f"profile={profile}, {ms:.0f}ms, "
                               f"cache={cache_size}")
 
                     dbg.log_timing("pc.translate_server", ms,
                                    {"count": len(texts), "engine": engine,
-                                    "target": target})
+                                    "profile": profile, "target": target})
 
-                    self._send_json({"translations": translations, "engine": engine})
+                    # ИЗМЕНЕНО: писать перевод в ocr_text.log
+                    # (только при изменении — блокировка по хэшу внутри)
+                    if translations and engine == "ctranslate2":
+                        log_translate_text(texts, translations)
+
+                    self._send_json({"translations": translations,
+                                     "engine": engine, "profile": profile})
                 except Exception as e:
                     print(f"[Translate-Server] ⚠️ Handler error: {e}")
                     traceback.print_exc()

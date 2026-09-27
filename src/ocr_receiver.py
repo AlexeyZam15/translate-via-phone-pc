@@ -4,8 +4,8 @@
 Плюс отдельный HTTP-сервер на PC_DEBUG_PORT для debug-метрик.
 
 ИЗМЕНЕНО:
-  - DebugReceiver фильтрует частые Android-стадии (_ANDROID_SKIP_STAGES),
-    чтобы debug_timing.jsonl не раздувался.
+  - DebugReceiver фильтрует частые Android-стадии (_ANDROID_SKIP_STAGES).
+  - OCR-блоки пишутся в ocr_text.log (только при изменении содержимого).
 """
 
 import hashlib
@@ -19,35 +19,28 @@ from src.config import (
     PC_DEBUG_PORT,
 )
 from src.debug_logger import logger as dbg
+from src.text_logger import log_ocr_text
 
-# ИЗМЕНЕНО: список Android-стадий, которые НЕ пишутся в debug_timing.jsonl.
-# Это частые технические события (агрегаты каждую секунду), от которых
-# лог раздувается до десятков MB.
 _ANDROID_SKIP_STAGES = {
-    # MJPEG
     "android.mjpeg_read_body",
     "android.mjpeg_frame_size_kb",
     "android.mjpeg_connect",
     "android.mjpeg_connect_attempt",
-    # OCR (детали)
     "android.pc_ocr_decode",
     "android.ocr_pass1_blocks",
     "android.ocr_pass2_blocks",
     "android.ocr_pass2_skipped",
     "android.ocr_pass2",
-    # HTTP-отправка на ПК
     "android.ocr_sender_build_json",
     "android.ocr_sender_http",
 }
 
 
 def _should_skip_android(stage: str) -> bool:
-    """Проверяет, нужно ли пропустить Android-запись для данного stage."""
     return stage in _ANDROID_SKIP_STAGES
 
 
 def _blocks_fingerprint(blocks) -> str:
-    """Возвращает хэш содержимого блоков."""
     h = hashlib.md5()
     for b in blocks:
         h.update(str(b.get('text', '')).encode('utf-8', errors='ignore'))
@@ -150,6 +143,9 @@ class OcrReceiver:
                                 f"{len(blocks)} blocks, "
                                 f"frame={fw}x{fh}, mode={mode}"
                             )
+                            # ИЗМЕНЕНО: писать текст в ocr_text.log
+                            # (только при изменении содержимого)
+                            log_ocr_text(blocks, mode=mode)
 
                     total_ms = (time.perf_counter() - t_start) * 1000.0
                     dbg.log_timing("pc.ocr_total", total_ms,
@@ -215,11 +211,7 @@ class OcrReceiver:
 
 
 class DebugReceiver:
-    """Отдельный HTTP-сервер для приёма debug-метрик от Android.
-
-    ИЗМЕНЕНО: фильтрует частые Android-стадии (_ANDROID_SKIP_STAGES),
-    чтобы debug_timing.jsonl не раздувался.
-    """
+    """Отдельный HTTP-сервер для приёма debug-метрик от Android."""
 
     def __init__(self):
         self.server = None
@@ -248,7 +240,6 @@ class DebugReceiver:
                     for rec in records:
                         if not isinstance(rec, dict):
                             continue
-                        # ИЗМЕНЕНО: фильтр Android-стадий
                         stage = rec.get("stage", "")
                         if _should_skip_android(stage):
                             skipped += 1

@@ -6,6 +6,7 @@
 
 ИЗМЕНЕНО:
   - src.translate_server в hidden-imports.
+  - src.settings_manager, src.settings_server в hidden-imports.
   - ctranslate2 + sentencepiece для HTTP-перевода (офлайн).
   - Модель через --add-data=models;models.
   - googletrans/argostranslate НЕ включены.
@@ -192,6 +193,8 @@ def build_exe():
         '--hidden-import=src.simple_gui',
         '--hidden-import=src.window_utils',
         '--hidden-import=src.translate_server',
+        '--hidden-import=src.settings_manager',
+        '--hidden-import=src.settings_server',
 
         # --- HTTP-перевод (CTranslate2 + SentencePiece) ---
         '--hidden-import=ctranslate2',
