@@ -15,12 +15,21 @@
 ИЗМЕНЕНО:
   - При остановке трансляции или закрытии ПК-приложения
     автоматически останавливается Android-приложение (force-stop).
+  - Кнопка НАЧАТЬ всегда активна:
+      • нет устройства → показываем инструкцию по подключению;
+      • устройство есть, приложения нет → диалог установки APK;
+      • всё готово → запуск трансляции.
+  - Добавлена установка APK через adb install.
+  - overlay_alpha по умолчанию = 0 (чёрный непрозрачный фон перевода).
+  - Из окна-инструкции по подключению убраны шаг 4 и блок
+    «Если ничего не помогает».
 """
 
+import os
 import time
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
 from src.pc_streamer import WindowStreamer
 from src.ocr_receiver import OcrReceiver, DebugReceiver
@@ -59,6 +68,7 @@ class SimplePhoneTranslator:
 
         self._settings_window = None
         self._help_window = None
+        self._connect_window = None
         self._settings_window_widgets = {}
 
         self.adb_status = None
@@ -73,8 +83,11 @@ class SimplePhoneTranslator:
         self._auto_refresh_timer = None
         self._auto_refresh_interval_ms = 3000
 
-        # Флаг: уже отправили force-stop (чтобы не дублировать)
+        # Флаг: уже отправили force-stop
         self._android_stopped = False
+
+        # Флаг: идёт установка APK
+        self._installing = False
 
         dbg.log_event("pc.simple_gui_init")
         self.create_widgets()
@@ -97,10 +110,12 @@ class SimplePhoneTranslator:
         )
         self.settings_btn.place(relx=1.0, x=-12, y=12, anchor="ne")
 
+        # Кнопка НАЧАТЬ всегда активна.
+        # Цвет меняется в _update_start_btn_state.
         self.start_btn = tk.Button(
             self.root, text="▶\nНАЧАТЬ", command=self.toggle_streaming,
-            font=("Arial", 28, "bold"), bg="#9E9E9E", fg="white",
-            relief=tk.FLAT, cursor="hand2", state=tk.DISABLED,
+            font=("Arial", 28, "bold"), bg="#607D8B", fg="white",
+            relief=tk.FLAT, cursor="hand2",
             activebackground="#4CAF50", activeforeground="white",
             justify=tk.CENTER
         )
@@ -118,7 +133,6 @@ class SimplePhoneTranslator:
     # ============================================================
 
     def log(self, message):
-        """Пишет в print. UI-лога нет, но метод используется везде."""
         try:
             print(f"[{time.strftime('%H:%M:%S')}] {message}")
         except Exception:
@@ -283,13 +297,12 @@ class SimplePhoneTranslator:
         debug_cb.pack(anchor=tk.W, pady=(4, 10))
         wg["debug"] = debug_cb
 
-        # Качество перевода
         tk.Label(parent, text="Качество перевода:", font=("Arial", 11, "bold"),
                  bg="#1e1e1e", fg="#e0e0e0").pack(anchor=tk.W, pady=(8, 4))
 
-        current_profile = settings_manager.get("translate_profile", "speed")
+        current_profile = settings_manager.get("translate_profile", "balanced")
         if current_profile not in TRANSLATE_PROFILE_LABELS:
-            current_profile = "speed"
+            current_profile = "balanced"
         current_label = TRANSLATE_PROFILE_LABELS[current_profile]
 
         profile_values = [TRANSLATE_PROFILE_LABELS[p]
@@ -318,7 +331,7 @@ class SimplePhoneTranslator:
                            settings_manager.get("ocr_padding", 0))
         self._build_slider(parent, "overlay_alpha",
                            "Прозрачность фона перевода", 0, 100, "%",
-                           settings_manager.get("overlay_alpha", 85))
+                           settings_manager.get("overlay_alpha", 0))
 
         tk.Frame(parent, bg="#3c3c3c", height=1).pack(fill=tk.X, pady=8)
         tk.Label(parent, text="Исходный язык:", font=("Arial", 11, "bold"),
@@ -354,7 +367,6 @@ class SimplePhoneTranslator:
                            "target_lang", tgt_var.get()))
         wg["target_lang"] = tgt_combo
 
-        # Статус
         tk.Frame(parent, bg="#3c3c3c", height=1).pack(fill=tk.X, pady=8)
         tk.Label(parent, text="Статус", font=("Arial", 12, "bold"),
                  bg="#1e1e1e", fg="#2196F3").pack(anchor=tk.W, pady=(4, 6))
@@ -382,7 +394,6 @@ class SimplePhoneTranslator:
                                       fg="#e0e0e0", anchor=tk.W)
         self.stream_status.pack(anchor=tk.W, pady=2)
 
-        # Кнопка сброса
         tk.Frame(parent, bg="#3c3c3c", height=1).pack(fill=tk.X, pady=12)
         reset_btn = tk.Button(
             parent, text="↺ Сбросить настройки", command=self._reset_settings,
@@ -513,8 +524,6 @@ class SimplePhoneTranslator:
     # ============================================================
 
     def _auto_stop_android_ocr(self):
-        """Отправляет force-stop на Android, чтобы остановить PcOcrService
-        и всё приложение."""
         if self._android_stopped:
             return
         self._android_stopped = True
@@ -636,12 +645,199 @@ class SimplePhoneTranslator:
             pass
 
     def _update_start_btn_state(self):
+        """Кнопка НАЧАТЬ всегда активна. Меняем только цвет и текст."""
         if self.streaming:
+            try:
+                self.start_btn.config(text="⏹\nОСТАНОВИТЬ", bg="#f44336")
+            except Exception:
+                pass
             return
+
         if self.adb_ready and self.selected_device is not None:
-            self.start_btn.config(state=tk.NORMAL, bg="#4CAF50")
+            try:
+                self.start_btn.config(text="▶\nНАЧАТЬ", bg="#4CAF50")
+            except Exception:
+                pass
         else:
-            self.start_btn.config(state=tk.DISABLED, bg="#9E9E9E")
+            try:
+                self.start_btn.config(text="▶\nНАЧАТЬ", bg="#607D8B")
+            except Exception:
+                pass
+
+    # ============================================================
+    # ОКНО-ИНСТРУКЦИЯ ПО ПОДКЛЮЧЕНИЮ
+    # ============================================================
+
+    def _show_connect_instructions(self):
+        """Показывает окно с инструкцией по подключению Android-устройства."""
+        if self._connect_window is not None:
+            try:
+                if self._connect_window.winfo_exists():
+                    self._connect_window.lift()
+                    self._connect_window.focus_force()
+                    return
+            except Exception:
+                self._connect_window = None
+
+        w = tk.Toplevel(self.root)
+        self._connect_window = w
+        w.title("📱 Подключение Android-устройства")
+        w.geometry("640x520")
+        w.minsize(520, 420)
+        w.configure(bg="#1e1e1e")
+        w.transient(self.root)
+        w.protocol("WM_DELETE_WINDOW", self._close_connect_window)
+
+        header = tk.Label(w, text="📱 Как подключить Android-устройство",
+                          font=("Arial", 15, "bold"),
+                          bg="#1e1e1e", fg="#4CAF50")
+        header.pack(pady=(18, 6))
+
+        tk.Frame(w, bg="#3c3c3c", height=1).pack(fill=tk.X, padx=20)
+
+        text_frame = tk.Frame(w, bg="#1e1e1e")
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=12)
+
+        scrollbar = tk.Scrollbar(text_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        help_text = tk.Text(text_frame, wrap=tk.WORD,
+                            font=("Segoe UI", 10),
+                            bg="#2d2d2d", fg="#e0e0e0",
+                            insertbackground="white",
+                            relief=tk.FLAT, padx=15, pady=10,
+                            yscrollcommand=scrollbar.set)
+        help_text.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=help_text.yview)
+
+        help_text.tag_configure("h1", font=("Segoe UI", 13, "bold"),
+                                foreground="#4CAF50",
+                                spacing1=10, spacing3=5)
+        help_text.tag_configure("h2", font=("Segoe UI", 11, "bold"),
+                                foreground="#2196F3",
+                                spacing1=8, spacing3=3)
+        help_text.tag_configure("ok", foreground="#4CAF50")
+        help_text.tag_configure("warn", foreground="#FF9800")
+
+        # ИЗМЕНЕНО: убран «Шаг 4» и блок «Если ничего не помогает».
+        lines = [
+            ("h1", "Шаг 1. Включите отладку по USB на телефоне"),
+            ("", "Откройте «Настройки» → «О телефоне» → 7 раз нажмите"),
+            ("", "на «Номер сборки». Появится раздел «Для разработчиков»."),
+            ("", "Зайдите в «Для разработчиков» и включите"),
+            ("", "«Отладка по USB» (USB debugging)."),
+            ("", ""),
+            ("h1", "Шаг 2. Подключите телефон к ПК кабелем"),
+            ("", "Важно: кабель должен поддерживать передачу данных,"),
+            ("", "а не только зарядку. Оригинальный кабель — лучший выбор."),
+            ("", ""),
+            ("h1", "Шаг 3. Разрешите отладку на телефоне"),
+            ("", "При первом подключении телефон покажет диалог"),
+            ("", "«Разрешить отладку по USB?». Нажмите «Разрешить»."),
+            ("", "Если галочка «Всегда разрешать с этого компьютера» —"),
+            ("", "поставьте её, чтобы не подтверждать каждый раз."),
+            ("", ""),
+            ("ok", "После подключения нажмите НАЧАТЬ ещё раз."),
+            ("ok", "Если приложения нет — программа предложит его установить."),
+        ]
+
+        for marker, line in lines:
+            if marker == "h1":
+                help_text.insert(tk.END, line + "\n", "h1")
+            elif marker == "h2":
+                help_text.insert(tk.END, line + "\n", "h2")
+            elif marker == "ok":
+                help_text.insert(tk.END, line + "\n", "ok")
+            elif marker == "warn":
+                help_text.insert(tk.END, line + "\n", "warn")
+            else:
+                help_text.insert(tk.END, line + "\n")
+
+        help_text.config(state=tk.DISABLED)
+
+        bottom = tk.Frame(w, bg="#1e1e1e")
+        bottom.pack(fill=tk.X, padx=20, pady=(0, 16))
+
+        refresh_btn = tk.Button(
+            bottom, text="🔄 Проверить подключение",
+            command=self._check_connect_and_maybe_close,
+            font=("Arial", 11), bg="#2196F3", fg="white",
+            relief=tk.FLAT, padx=20, pady=8, cursor="hand2"
+        )
+        refresh_btn.pack(side=tk.LEFT)
+
+        close_btn = tk.Button(
+            bottom, text="Закрыть",
+            command=self._close_connect_window,
+            font=("Arial", 11, "bold"), bg="#4CAF50", fg="white",
+            relief=tk.FLAT, padx=30, pady=8, cursor="hand2"
+        )
+        close_btn.pack(side=tk.RIGHT)
+
+        w.bind("<Escape>", lambda e: self._close_connect_window())
+        w.focus_force()
+
+    def _close_connect_window(self):
+        if self._connect_window is not None:
+            try:
+                self._connect_window.destroy()
+            except Exception:
+                pass
+            self._connect_window = None
+
+    def _check_connect_and_maybe_close(self):
+        """Обновляет устройства; если появилось — закрывает окно."""
+        self.refresh_devices_manual()
+        if self.adb_ready and self.selected_device:
+            self.log("✅ Устройство подключено")
+            self._close_connect_window()
+
+    # ============================================================
+    # УСТАНОВКА APK
+    # ============================================================
+
+    def _install_android_app_async(self, on_done):
+        """
+        Запускает установку APK в фоновом потоке.
+        on_done(ok: bool, message: str) вызывается в UI-потоке.
+        """
+        if self._installing:
+            return
+        if not self.selected_device:
+            on_done(False, "Устройство не выбрано")
+            return
+
+        apk_path = adb_utils.get_apk_path()
+        if apk_path is None:
+            on_done(False, "APK-файл не найден рядом с приложением.\n"
+                           "Положите app-debug.apk рядом с main.py (или .exe).")
+            return
+
+        self._installing = True
+        self.log(f"📦 Установка APK: {apk_path}")
+        try:
+            self.start_btn.config(text="⏳\nУСТАНОВКА...", bg="#FF9800")
+        except Exception:
+            pass
+
+        def _worker():
+            ok, msg = adb_utils.install_android_app(
+                self.selected_device, apk_path, reinstall=True)
+            self.root.after(0, lambda: self._on_install_done(ok, msg, on_done))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_install_done(self, ok, msg, on_done):
+        self._installing = False
+        self._update_start_btn_state()
+        if ok:
+            self.log("✅ APK установлен")
+        else:
+            self.log(f"❌ Ошибка установки APK: {msg[:200]}")
+        try:
+            on_done(ok, msg)
+        except Exception:
+            pass
 
     # ============================================================
     # ТРАНСЛЯЦИЯ
@@ -654,15 +850,65 @@ class SimplePhoneTranslator:
             self.start_streaming()
 
     def start_streaming(self):
+        """
+        Трёхступенчатая логика:
+          1) Нет ADB/устройства → окно с инструкцией.
+          2) Устройство есть, приложения нет → подтверждение + установка APK.
+          3) Всё готово → запуск трансляции.
+        """
         if self.streaming:
             return
 
         if not self.adb_ready or not self.selected_device:
-            self.log("❌ ADB не готов или устройство не выбрано")
-            self._do_refresh(silent=False)
-            if not self.adb_ready:
+            self._do_refresh(silent=True)
+            if not self.adb_ready or not self.selected_device:
+                self.log("📱 Устройство не подключено — показываю инструкцию")
+                self._show_connect_instructions()
                 return
 
+        self.log("🔍 Проверка наличия приложения на устройстве...")
+        try:
+            installed = adb_utils.is_package_installed(
+                self.selected_device, adb_utils.ANDROID_PACKAGE)
+        except Exception as e:
+            self.log(f"⚠️ Ошибка проверки пакета: {e}")
+            installed = False
+
+        if installed:
+            self.log("✅ Приложение уже установлено")
+            self._start_streaming_after_checks()
+            return
+
+        apk_path = adb_utils.get_apk_path()
+        apk_info = (f"\n\nAPK: {os.path.basename(apk_path)}"
+                    if apk_path else
+                    "\n\n⚠️ APK-файл не найден рядом с приложением.")
+
+        answer = messagebox.askyesno(
+            "Установить приложение?",
+            "На Android-устройстве не найдено приложение "
+            "ScreenTranslator.\n\n"
+            "Установить его сейчас через ADB?" + apk_info,
+            parent=self.root,
+        )
+        if not answer:
+            self.log("ℹ️ Установка отменена пользователем")
+            return
+
+        def _after_install(ok, msg):
+            if ok:
+                self._start_streaming_after_checks()
+            else:
+                messagebox.showerror(
+                    "Ошибка установки",
+                    f"Не удалось установить APK:\n\n{msg}",
+                    parent=self.root,
+                )
+
+        self._install_android_app_async(_after_install)
+
+    def _start_streaming_after_checks(self):
+        """Запуск трансляции после всех проверок и (опционально) установки."""
         self._reset_android_stopped_flag()
 
         if bool(settings_manager.get("auto_launch_android", True)):
@@ -711,10 +957,8 @@ class SimplePhoneTranslator:
 
     def _do_start_streaming(self):
         self.streaming = True
-        try:
-            self.start_btn.config(text="⏹\nОСТАНОВИТЬ", bg="#f44336")
-        except Exception:
-            pass
+        self._update_start_btn_state()
+
         try:
             if self.stream_status is not None:
                 self.stream_status.config(text="🟢 Трансляция: запущена")
@@ -726,10 +970,7 @@ class SimplePhoneTranslator:
             if not self.ocr_receiver.start():
                 self.log("❌ Не удалось запустить приёмник OCR")
                 self.streaming = False
-                try:
-                    self.start_btn.config(text="▶\nНАЧАТЬ", bg="#4CAF50")
-                except Exception:
-                    pass
+                self._update_start_btn_state()
                 try:
                     if self.stream_status is not None:
                         self.stream_status.config(
@@ -780,7 +1021,8 @@ class SimplePhoneTranslator:
                         hwnd = self.pc_streamer.hwnd
                         title = self.pc_streamer.window_title or "?"
                         if hwnd:
-                            self.root.after(0, lambda: self.on_hwnd_changed(hwnd, title))
+                            self.root.after(
+                                0, lambda: self.on_hwnd_changed(hwnd, title))
                         else:
                             self.root.after(0, lambda: self._set_window_status(
                                 "🪟 Окно: ожидание активного..."))
@@ -807,10 +1049,7 @@ class SimplePhoneTranslator:
     def _on_streamer_start_failed(self):
         self.log("❌ Не удалось запустить трансляцию")
         self.streaming = False
-        try:
-            self.start_btn.config(text="▶\nНАЧАТЬ", bg="#4CAF50")
-        except Exception:
-            pass
+        self._update_start_btn_state()
         try:
             if self.stream_status is not None:
                 self.stream_status.config(text="🔴 Трансляция: остановлена")
@@ -868,10 +1107,7 @@ class SimplePhoneTranslator:
             return
 
         self.streaming = False
-        try:
-            self.start_btn.config(text="▶\nНАЧАТЬ", bg="#4CAF50")
-        except Exception:
-            pass
+        self._update_start_btn_state()
         try:
             if self.stream_status is not None:
                 self.stream_status.config(text="🔴 Трансляция: остановлена")
@@ -879,14 +1115,12 @@ class SimplePhoneTranslator:
             pass
         self._set_window_status("🪟 Окно: активное (авто)")
 
-        # Автостоп Android OCR
         self._auto_stop_android_ocr()
 
         threading.Thread(target=self._cleanup_streamer, daemon=True).start()
 
         self.log("⏹ Трансляция остановлена (Android OCR остановлен)")
         dbg.log_event("pc.simple_gui_stream_stopped")
-        self._update_start_btn_state()
 
     def on_overlay_closed(self):
         if self.streaming:
@@ -894,7 +1128,7 @@ class SimplePhoneTranslator:
             self.stop_streaming()
 
     # ============================================================
-    # ИНСТРУКЦИЯ
+    # ИНСТРУКЦИЯ (общая)
     # ============================================================
 
     def show_help_window(self):
@@ -914,11 +1148,14 @@ class SimplePhoneTranslator:
         self._help_window.configure(bg="#1e1e1e")
         self._help_window.transient(self.root)
 
-        header = tk.Label(self._help_window, text="📖 Инструкция по использованию",
-                          font=("Arial", 16, "bold"), bg="#1e1e1e", fg="#4CAF50")
+        header = tk.Label(self._help_window,
+                          text="📖 Инструкция по использованию",
+                          font=("Arial", 16, "bold"),
+                          bg="#1e1e1e", fg="#4CAF50")
         header.pack(pady=(15, 5))
 
-        tk.Frame(self._help_window, bg="#3c3c3c", height=1).pack(fill=tk.X, padx=20)
+        tk.Frame(self._help_window, bg="#3c3c3c",
+                 height=1).pack(fill=tk.X, padx=20)
 
         text_frame = tk.Frame(self._help_window, bg="#1e1e1e")
         text_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
@@ -927,16 +1164,19 @@ class SimplePhoneTranslator:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         help_text = tk.Text(text_frame, wrap=tk.WORD, font=("Segoe UI", 10),
-                            bg="#2d2d2d", fg="#e0e0e0", insertbackground="white",
+                            bg="#2d2d2d", fg="#e0e0e0",
+                            insertbackground="white",
                             relief=tk.FLAT, padx=15, pady=10,
                             yscrollcommand=scrollbar.set)
         help_text.pack(fill=tk.BOTH, expand=True)
         scrollbar.config(command=help_text.yview)
 
         help_text.tag_configure("h1", font=("Segoe UI", 13, "bold"),
-                                foreground="#4CAF50", spacing1=10, spacing3=5)
+                                foreground="#4CAF50",
+                                spacing1=10, spacing3=5)
         help_text.tag_configure("h2", font=("Segoe UI", 11, "bold"),
-                                foreground="#2196F3", spacing1=8, spacing3=3)
+                                foreground="#2196F3",
+                                spacing1=8, spacing3=3)
         help_text.tag_configure("ok", foreground="#4CAF50")
         help_text.tag_configure("warn", foreground="#FF9800")
 
@@ -950,8 +1190,10 @@ class SimplePhoneTranslator:
                               cursor="hand2")
         close_btn.pack(pady=(0, 15))
 
-        self._help_window.bind("<Escape>", lambda e: self._close_help_window())
-        self._help_window.protocol("WM_DELETE_WINDOW", self._close_help_window)
+        self._help_window.bind("<Escape>",
+                               lambda e: self._close_help_window())
+        self._help_window.protocol("WM_DELETE_WINDOW",
+                                   self._close_help_window)
         self._help_window.focus_force()
 
     def _close_help_window(self):
@@ -968,15 +1210,12 @@ class SimplePhoneTranslator:
             ("", ""),
             ("===H2===", "1. Подключите телефон к ПК по USB"),
             ("", "На телефоне должно быть разрешено \"Отладка по USB\"."),
-            ("", "Обычно при первом подключении телефон сам показывает"),
-            ("", "диалог \"Разрешить отладку по USB?\" — нажмите \"Разрешить\"."),
+            ("", "Подробнее — нажмите НАЧАТЬ без подключённого телефона."),
             ("", ""),
             ("===H2===", "2. Нажмите \"▶ НАЧАТЬ\""),
-            ("", "Всё остальное программа сделает сама:"),
-            ("===OK===", "• найдёт телефон;"),
-            ("===OK===", "• запустит Android-приложение;"),
-            ("===OK===", "• запустит трансляцию активного окна;"),
-            ("===OK===", "• включит OCR и перевод."),
+            ("", "Если устройство не подключено — откроется инструкция."),
+            ("", "Если приложения нет — программа предложит установить APK."),
+            ("", "Если всё готово — запустится трансляция и перевод."),
             ("", ""),
             ("===H2===", "3. Перевод появится на ПК"),
             ("", "Поверх исходного окна появится перевод."),
@@ -995,38 +1234,16 @@ class SimplePhoneTranslator:
             ("", ""),
             ("===H2===", "Debug (показать OCR-рамки)"),
             ("", "Показывает рамки распознанных блоков."),
-            ("", "Порог уверенности работает и в Debug-режиме."),
             ("", ""),
             ("===H2===", "Качество перевода"),
             ("", "Скорость — самый быстрый режим, минимальная задержка."),
             ("", "Баланс — компромисс между скоростью и качеством."),
             ("", "Качество — самый точный перевод, но медленнее."),
             ("", ""),
-            ("===H2===", "Порог уверенности"),
-            ("", "Блоки с уверенностью ниже порога игнорируются."),
-            ("", "Работает и в Debug-режиме."),
-            ("", ""),
-            ("===H2===", "Отступ OCR"),
-            ("", "Дополнительный отступ вокруг блока при повторном OCR."),
-            ("", ""),
-            ("===H2===", "Прозрачность фона перевода"),
-            ("", "0% — полностью прозрачный, 100% — непрозрачный."),
-            ("", ""),
-            ("===H1===", "Если что-то не работает"),
-            ("", ""),
-            ("===WARN===", "Проверьте, что:"),
-            ("", "• телефон подключён кабелем (не только для зарядки);"),
-            ("", "• на телефоне разрешена \"Отладка по USB\";"),
-            ("", "• в окне настроек статус ADB зелёный."),
-            ("", ""),
-            ("", "Если статус ADB красный — переподключите кабель."),
-            ("", "Если на телефоне был запрос на отладку — разрешите его."),
-            ("", ""),
             ("===H1===", "Настройки сохраняются автоматически"),
             ("", ""),
             ("", "Все настройки сохраняются в файл settings.json"),
             ("", "рядом с программой и применяются при следующем запуске."),
-            ("", "Кнопка \"↺ Сбросить настройки\" возвращает значения по умолчанию."),
         ]
 
         for marker, line in lines:
@@ -1065,12 +1282,14 @@ class SimplePhoneTranslator:
 
         self._close_help_window()
         self._close_settings_window()
+        self._close_connect_window()
 
         if self.streaming:
             self.streaming = False
             self._auto_stop_android_ocr()
             try:
-                threading.Thread(target=self._cleanup_streamer, daemon=True).start()
+                threading.Thread(target=self._cleanup_streamer,
+                                 daemon=True).start()
             except Exception:
                 pass
         else:

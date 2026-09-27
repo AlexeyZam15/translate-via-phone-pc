@@ -1,6 +1,7 @@
 # src/adb_utils.py
 """Утилиты для работы с ADB."""
 
+import os
 import shutil
 import socket
 import subprocess
@@ -12,6 +13,23 @@ ADB_TIMEOUT = 15  # секунд
 ANDROID_PACKAGE = "com.example.screentranslator"
 ANDROID_MAIN_ACTIVITY = ".MainActivity"
 ANDROID_PC_OCR_SERVICE = ".PcOcrService"
+
+# Кандидаты имён APK — ищем рядом с приложением
+ANDROID_APK_NAME = "app-debug.apk"
+ANDROID_APK_CANDIDATES = [
+    "app-debug.apk",
+    "app-release.apk",
+    "ScreenTranslator.apk",
+    "screentranslator.apk",
+]
+
+
+def _get_app_dir() -> str:
+    """Папка приложения (exe или корень проекта)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    # src/adb_utils.py → на два уровня вверх = корень проекта
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def check_adb_available() -> bool:
@@ -106,6 +124,112 @@ def get_local_ip():
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+# ============================================================
+# APK: поиск / проверка / установка
+# ============================================================
+
+def get_apk_path():
+    """
+    Ищет APK-файл рядом с приложением.
+
+    Порядок поиска:
+      1) корень приложения (APP_DIR / папка exe) — сюда пользователь
+         кладёт app-debug.apk;
+      2) подпапка apk/;
+      3) подпапка dist/ (на случай сборки из исходников).
+
+    Возвращает полный путь к APK или None.
+    """
+    app_dir = _get_app_dir()
+    search_dirs = [
+        app_dir,
+        os.path.join(app_dir, "apk"),
+        os.path.join(app_dir, "dist"),
+    ]
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        for name in ANDROID_APK_CANDIDATES:
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def is_package_installed(serial: str,
+                         package: str = ANDROID_PACKAGE) -> bool:
+    """
+    Проверяет, установлен ли пакет на устройстве.
+    Возвращает True/False. При ошибке — False.
+    """
+    if not serial:
+        return False
+    result = _run_adb(
+        ["-s", serial, "shell", "pm", "list", "packages", package],
+        timeout=10,
+    )
+    if result is None:
+        return False
+    rc, out, err = result
+    if rc != 0:
+        return False
+    # pm list packages com.example.foo вернёт "package:com.example.foo"
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("package:") and line[8:].strip() == package:
+            return True
+    return False
+
+
+def install_android_app(serial: str, apk_path: str,
+                        reinstall: bool = True,
+                        package: str = ANDROID_PACKAGE):
+    """
+    Устанавливает APK на устройство через adb install.
+    Возвращает (ok: bool, message: str).
+    """
+    if not serial:
+        return False, "Устройство не выбрано"
+    if not apk_path or not os.path.isfile(apk_path):
+        return False, f"APK не найден: {apk_path}"
+
+    args = ["-s", serial, "install"]
+    if reinstall:
+        args.append("-r")
+    args.append(apk_path)
+
+    print(f"[ADB] 📦 Установка APK: {os.path.basename(apk_path)}")
+    result = _run_adb(args, timeout=180)  # установка может быть долгой
+    if result is None:
+        return False, "adb install не ответил (таймаут)"
+
+    rc, out, err = result
+    combined = (out + "\n" + err).strip()
+    ok = (rc == 0) and ("Success" in combined) and ("Failure" not in combined)
+
+    if ok:
+        print(f"[ADB] ✅ APK установлен: {os.path.basename(apk_path)}")
+        return True, "Success"
+    else:
+        print(f"[ADB] ⚠️ Ошибка установки APK: rc={rc}, "
+              f"out={out.strip()[:300]}, err={err.strip()[:300]}")
+        return False, combined[:500]
+
+
+def uninstall_android_app(serial: str,
+                          package: str = ANDROID_PACKAGE):
+    """Удаляет пакет с устройства. Возвращает (ok, message)."""
+    if not serial:
+        return False, "Устройство не выбрано"
+    result = _run_adb(["-s", serial, "uninstall", package], timeout=60)
+    if result is None:
+        return False, "adb uninstall не ответил (таймаут)"
+    rc, out, err = result
+    combined = (out + "\n" + err).strip()
+    ok = (rc == 0) and ("Success" in combined)
+    return ok, combined[:500]
 
 
 # ============================================================

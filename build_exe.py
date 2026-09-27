@@ -10,6 +10,7 @@
   - ctranslate2 + sentencepiece для HTTP-перевода (офлайн).
   - Модель через --add-data=models;models.
   - googletrans/argostranslate НЕ включены.
+  - Копирование app-debug.apk рядом с exe (для установки на Android).
 """
 
 import PyInstaller.__main__
@@ -32,6 +33,14 @@ MAIN_SCRIPT = "main.py"
 CLEAN_BEFORE_BUILD = True
 
 EXTERNAL_TOOLS = ["adb.exe"]
+
+# Кандидаты APK — ищем рядом с проектом и копируем в dist
+APK_CANDIDATES = [
+    "app-debug.apk",
+    "app-release.apk",
+    "ScreenTranslator.apk",
+    "screentranslator.apk",
+]
 
 EXCLUDED_MODULES = [
     'PyQt5', 'PySide2', 'PySide6', 'PyQt6',
@@ -73,6 +82,16 @@ def clean_old_build():
                     print(f"🗑️  Удалена папка: {folder}")
                 except Exception as e:
                     print(f"⚠️  Не удалось удалить {folder}: {e}")
+
+
+def _find_apk() -> str:
+    """Ищет APK рядом с build_exe.py."""
+    root = os.path.dirname(os.path.abspath(__file__))
+    for name in APK_CANDIDATES:
+        p = os.path.join(root, name)
+        if os.path.isfile(p):
+            return p
+    return ""
 
 
 def build_exe():
@@ -219,6 +238,17 @@ def build_exe():
     else:
         print("⚠️  Папка models/ не найдена — HTTP-перевод не будет работать в exe")
 
+    # ИЗМЕНЕНО: копируем APK в папку сборки через --add-data.
+    # PyInstaller кладёт файл рядом с exe в onedir-режиме.
+    apk_path = _find_apk()
+    if apk_path:
+        args.append(f'--add-data={apk_path};.')
+        print(f"✅ APK добавлен в сборку: {os.path.basename(apk_path)}")
+    else:
+        print("⚠️  APK не найден рядом с build_exe.py — "
+              "установка приложения из exe не сработает. "
+              "Положите app-debug.apk рядом с build_exe.py.")
+
     if os.path.exists(APP_ICON):
         args.append(f'--icon={APP_ICON}')
         print(f"✅ Иконка: {APP_ICON}")
@@ -252,12 +282,14 @@ def build_exe():
 
 
 def copy_external_tools():
+    """Копирует adb.exe и APK рядом с exe (страховка)."""
     output_app_dir = f"{OUTPUT_DIR}/{APP_NAME}"
     if not os.path.exists(output_app_dir):
         return
 
     print("\n📦 Копирование внешних утилит...")
 
+    # adb.exe
     adb_src = shutil.which("adb.exe")
     if not adb_src and os.path.exists("adb.exe"):
         adb_src = "adb.exe"
@@ -270,6 +302,21 @@ def copy_external_tools():
             print(f"   ⚠️  Не удалось скопировать adb.exe: {e}")
     else:
         print("   ⚠️  adb.exe не найден (ни рядом, ни в PATH).")
+
+    # APK — страховка, если --add-data не сработал
+    apk_src = _find_apk()
+    if apk_src:
+        dst = os.path.join(output_app_dir, os.path.basename(apk_src))
+        if not os.path.exists(dst):
+            try:
+                shutil.copy2(apk_src, dst)
+                print(f"   ✅ {os.path.basename(apk_src)} ← {apk_src}")
+            except Exception as e:
+                print(f"   ⚠️  Не удалось скопировать APK: {e}")
+        else:
+            print(f"   ✅ APK уже на месте: {os.path.basename(apk_src)}")
+    else:
+        print("   ⚠️  APK не найден — установка приложения из exe не сработает.")
 
 
 def show_size_info():

@@ -68,10 +68,10 @@ TRANSLATE_PROFILE_LABELS = {
 # Android при старте забирает эти значения с ПК через GET /settings.
 DEFAULT_SETTINGS = {
     "debug": False,  # показать OCR-рамки
-    "translate_profile": "balanced",  # speed / balanced / quality (по умолчанию Баланс)
+    "translate_profile": "balanced",  # speed / balanced / quality
     "confidence": 0,  # 0..100 (порог уверенности)
     "ocr_padding": 0,  # 0..50 (отступ OCR, %)
-    "overlay_alpha": 85,  # 0..100 (прозрачность фона перевода)
+    "overlay_alpha": 0,  # 0..100 (прозрачность фона перевода) — 0 = чёрный фон
     "source_lang": "auto",  # auto / en / ru / ...
     "target_lang": "ru",  # ru / en / ...
     "auto_launch_android": True,  # автоматически запускать Android-приложение
