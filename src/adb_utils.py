@@ -1,7 +1,10 @@
 # src/adb_utils.py
 """Утилиты для работы с ADB."""
 
+import glob
+import hashlib
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -22,6 +25,8 @@ ANDROID_APK_CANDIDATES = [
     "ScreenTranslator.apk",
     "screentranslator.apk",
 ]
+
+_aapt_cache = None  # кэш пути к aapt
 
 
 def _get_app_dir() -> str:
@@ -79,6 +84,42 @@ def _run_adb(args, timeout=ADB_TIMEOUT):
         return None
 
 
+def _run_adb_bytes(args, timeout=ADB_TIMEOUT):
+    """
+    Запускает adb и возвращает (returncode, stdout_bytes, stderr_bytes).
+    Для команд, где нужен бинарный вывод (pull и т.п.).
+    """
+    try:
+        proc = subprocess.Popen(
+            ["adb"] + args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return proc.returncode, stdout, stderr
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.communicate(timeout=2)
+        except Exception:
+            pass
+        return None
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return None
+
+
 def scan_devices():
     """Возвращает список ADB-устройств (USB первыми, потом Wi-Fi)."""
     usb_devices = []
@@ -127,7 +168,7 @@ def get_local_ip():
 
 
 # ============================================================
-# APK: поиск / проверка / установка
+# APK: поиск
 # ============================================================
 
 def get_apk_path():
@@ -135,8 +176,7 @@ def get_apk_path():
     Ищет APK-файл рядом с приложением.
 
     Порядок поиска:
-      1) корень приложения (APP_DIR / папка exe) — сюда пользователь
-         кладёт app-debug.apk;
+      1) корень приложения (APP_DIR / папка exe);
       2) подпапка apk/;
       3) подпапка dist/ (на случай сборки из исходников).
 
@@ -158,30 +198,77 @@ def get_apk_path():
     return None
 
 
-def is_package_installed(serial: str,
-                         package: str = ANDROID_PACKAGE) -> bool:
+# ============================================================
+# APK: хэш
+# ============================================================
+
+def apk_sha256(apk_path) -> str:
     """
-    Проверяет, установлен ли пакет на устройстве.
-    Возвращает True/False. При ошибке — False.
+    Считает SHA-256 APK-файла. Возвращает hex-строку.
+    При ошибке — пустую строку.
+    """
+    if not apk_path or not os.path.isfile(apk_path):
+        return ""
+    try:
+        h = hashlib.sha256()
+        with open(apk_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception as e:
+        print(f"⚠️ Не удалось посчитать хэш APK: {e}")
+        return ""
+
+
+def get_remote_apk_hash(serial: str,
+                        package: str = ANDROID_PACKAGE) -> str:
+    """
+    Возвращает SHA-256 APK, установленного на устройстве.
+    Работает так:
+      1) adb shell pm path <package>   → путь к base.apk
+      2) adb pull <path> -             → поток в stdout
+      3) считаем SHA-256
+    При ошибке — пустую строку.
     """
     if not serial:
-        return False
-    result = _run_adb(
-        ["-s", serial, "shell", "pm", "list", "packages", package],
-        timeout=10,
-    )
+        return ""
+
+    # 1) Путь к APK на устройстве
+    result = _run_adb(["-s", serial, "shell", "pm", "path", package],
+                      timeout=10)
     if result is None:
-        return False
+        return ""
     rc, out, err = result
     if rc != 0:
-        return False
-    # pm list packages com.example.foo вернёт "package:com.example.foo"
+        return ""
+
+    apk_remote_path = ""
     for line in out.splitlines():
         line = line.strip()
-        if line.startswith("package:") and line[8:].strip() == package:
-            return True
-    return False
+        if line.startswith("package:"):
+            apk_remote_path = line[8:].strip()
+            break
+    if not apk_remote_path:
+        return ""
 
+    # 2) adb pull <path> -   → бинарный поток в stdout
+    res = _run_adb_bytes(["-s", serial, "pull", apk_remote_path, "-"],
+                         timeout=60)
+    if res is None:
+        return ""
+    rc, stdout, stderr = res
+    if rc != 0:
+        return ""
+
+    try:
+        return hashlib.sha256(stdout).hexdigest()
+    except Exception:
+        return ""
+
+
+# ============================================================
+# APK: установка / удаление
+# ============================================================
 
 def install_android_app(serial: str, apk_path: str,
                         reinstall: bool = True,
@@ -201,7 +288,7 @@ def install_android_app(serial: str, apk_path: str,
     args.append(apk_path)
 
     print(f"[ADB] 📦 Установка APK: {os.path.basename(apk_path)}")
-    result = _run_adb(args, timeout=180)  # установка может быть долгой
+    result = _run_adb(args, timeout=180)
     if result is None:
         return False, "adb install не ответил (таймаут)"
 
@@ -232,6 +319,98 @@ def uninstall_android_app(serial: str,
     return ok, combined[:500]
 
 
+def is_package_installed(serial: str,
+                         package: str = ANDROID_PACKAGE) -> bool:
+    """Проверяет, установлен ли пакет. Возвращает True/False."""
+    if not serial:
+        return False
+    result = _run_adb(
+        ["-s", serial, "shell", "pm", "list", "packages", package],
+        timeout=10,
+    )
+    if result is None:
+        return False
+    rc, out, err = result
+    if rc != 0:
+        return False
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("package:") and line[8:].strip() == package:
+            return True
+    return False
+
+
+def ensure_app_installed(serial: str, apk_path: str,
+                         known_hash: str = "",
+                         package: str = ANDROID_PACKAGE):
+    """
+    Версионный контроль по SHA-256 хэшу APK.
+
+    Возвращает (ok: bool, action: str, message: str, new_hash: str).
+    action:
+      "none"       — приложение уже актуально, ничего не делаем
+      "install"    — приложения не было, установили
+      "reinstall"  — установили поверх (install -r), данные сохранены
+      "update"     — удалили старую и поставили новую (данные потеряны)
+      "error"      — ошибка
+
+    Логика:
+      1) Нет приложения             → install
+      2) Хэш APK == known_hash      → none
+      3) Хэш отличается:
+         a) install -r              → если ок → reinstall
+         b) uninstall + install     → update
+      4) Не смогли посчитать хэш    → install -r (best effort)
+    """
+    if not serial:
+        return False, "error", "Устройство не выбрано", ""
+    if not apk_path or not os.path.isfile(apk_path):
+        return False, "error", f"APK не найден: {apk_path}", ""
+
+    apk_hash = apk_sha256(apk_path)
+    if not apk_hash:
+        return False, "error", "Не удалось посчитать хэш APK", ""
+
+    installed = is_package_installed(serial, package)
+
+    if not installed:
+        print(f"[ADB] ℹ️ Приложение не установлено — ставим APK")
+        ok, msg = install_android_app(serial, apk_path, reinstall=False)
+        return ok, ("install" if ok else "error"), msg, (apk_hash if ok else "")
+
+    # Установлено — сравниваем хэши
+    if known_hash and apk_hash == known_hash:
+        print(f"[ADB] ✅ Хэш APK совпадает с сохранённым — "
+              f"приложение актуально")
+        return True, "none", "APK актуален", apk_hash
+
+    # Хэш неизвестен или отличается.
+    # Если known_hash пуст — возможно, это первый запуск после обновления
+    # логики; попробуем узнать хэш APK на устройстве.
+    if not known_hash:
+        remote_hash = get_remote_apk_hash(serial, package)
+        if remote_hash and remote_hash == apk_hash:
+            print(f"[ADB] ✅ Хэш на устройстве совпадает с APK — "
+                  f"запоминаем и работаем")
+            return True, "none", "APK актуален", apk_hash
+
+    print(f"[ADB] 🔄 Хэш APK изменился — обновляем приложение")
+
+    # install -r (сохраняет данные)
+    ok, msg = install_android_app(serial, apk_path, reinstall=True)
+    if ok:
+        return True, "reinstall", msg, apk_hash
+
+    # Не вышло — сносим и ставим заново
+    print(f"[ADB] ⚠️ install -r не сработал, переустанавливаем с нуля")
+    ok_un, msg_un = uninstall_android_app(serial, package)
+    if not ok_un:
+        return False, "error", f"Не удалось удалить: {msg_un}", ""
+
+    ok, msg = install_android_app(serial, apk_path, reinstall=False)
+    return ok, ("update" if ok else "error"), msg, (apk_hash if ok else "")
+
+
 # ============================================================
 # Запуск Android-приложения и сервиса
 # ============================================================
@@ -241,11 +420,8 @@ def launch_android_app(serial: str,
                        activity: str = ANDROID_MAIN_ACTIVITY,
                        auto_start_ocr: bool = False) -> bool:
     """
-    Запускает MainActivity Android-приложения (или выводит на передний план,
-    если оно уже запущено).
-
-    Если auto_start_ocr=True — передаёт extra auto_start_ocr=true,
-    MainActivity сам запустит PcOcrService.
+    Запускает MainActivity Android-приложения.
+    Если auto_start_ocr=True — передаёт extra auto_start_ocr=true.
     """
     if not serial:
         return False
@@ -272,7 +448,7 @@ def start_pc_ocr_service(serial: str,
                          package: str = ANDROID_PACKAGE,
                          service: str = ANDROID_PC_OCR_SERVICE,
                          engine: str = "ML_KIT") -> bool:
-    """Запускает PcOcrService напрямую через am start-foreground-service."""
+    """Запускает PcOcrService напрямую."""
     if not serial:
         return False
     args = ["-s", serial, "shell", "am", "start-foreground-service",
@@ -294,7 +470,7 @@ def start_pc_ocr_service(serial: str,
 def stop_pc_ocr_service(serial: str,
                         package: str = ANDROID_PACKAGE,
                         service: str = ANDROID_PC_OCR_SERVICE) -> bool:
-    """Останавливает PcOcrService через am stop-service."""
+    """Останавливает PcOcrService."""
     if not serial:
         return False
     args = ["-s", serial, "shell", "am", "stop-service",
@@ -310,10 +486,7 @@ def stop_pc_ocr_service(serial: str,
 
 def force_stop_android_app(serial: str,
                            package: str = ANDROID_PACKAGE) -> bool:
-    """
-    Принудительно останавливает Android-приложение (включая PcOcrService).
-    Используется при остановке трансляции или закрытии ПК-приложения.
-    """
+    """Принудительно останавливает Android-приложение."""
     if not serial:
         return False
     args = ["-s", serial, "shell", "am", "force-stop", package]
@@ -334,12 +507,7 @@ def push_settings_to_android(serial: str,
                              settings_json: str,
                              package: str = ANDROID_PACKAGE,
                              silent: bool = True) -> bool:
-    """
-    Отправляет настройки на Android через am broadcast.
-    Android-приложение должно иметь BroadcastReceiver,
-    слушающий action=com.example.screentranslator.SETTINGS
-    с extra settings_json.
-    """
+    """Отправляет настройки на Android через am broadcast."""
     if not serial:
         return False
     args = ["-s", serial, "shell", "am", "broadcast",

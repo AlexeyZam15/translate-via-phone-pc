@@ -75,6 +75,10 @@ DEFAULT_SETTINGS = {
     "source_lang": "auto",  # auto / en / ru / ...
     "target_lang": "ru",  # ru / en / ...
     "auto_launch_android": True,  # автоматически запускать Android-приложение
+    # SHA-256 последнего APK, успешно установленного на телефон.
+    # Используется для версионного контроля: если хэш APK из папки
+    # не совпадает с сохранённым — предлагается переустановка.
+    "last_installed_apk_hash": "",
 }
 
 LANGUAGES = ["auto", "en", "ru", "de", "fr", "es", "it", "zh", "ja"]

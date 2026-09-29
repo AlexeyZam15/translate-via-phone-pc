@@ -1,25 +1,16 @@
 # src/simple_gui.py
 """Упрощённый GUI translate_via_phone.
 
-Главное окно повторяет структуру Android-приложения:
-  - огромная кнопка НАЧАТЬ / ОСТАНОВИТЬ на весь экран;
-  - кнопка-шестерёнка ⚙ в правом верхнем углу.
-
-Внутри шестерёнки:
-  - все настройки (перенесены с Android);
-  - статус (ADB, устройство, окно, трансляция);
-  - кнопка «Инструкция»;
-  - кнопка «Сбросить настройки»;
-  - галочка «Автоматически запускать Android-приложение».
-
 ИЗМЕНЕНО:
   - При остановке трансляции или закрытии ПК-приложения
     автоматически останавливается Android-приложение (force-stop).
   - Кнопка НАЧАТЬ всегда активна:
       • нет устройства → показываем инструкцию по подключению;
-      • устройство есть, приложения нет → диалог установки APK;
-      • всё готово → запуск трансляции.
-  - Добавлена установка APK через adb install.
+      • APK изменился    → диалог обновления;
+      • APK актуален     → сразу запуск трансляции.
+  - Версионный контроль по SHA-256 хэшу APK, без versionCode.
+    Собрал новый APK → положил в папку → при следующем НАЧАТЬ
+    программа сама предложит обновить.
   - overlay_alpha по умолчанию = 0 (чёрный непрозрачный фон перевода).
   - Из окна-инструкции по подключению убраны шаг 4 и блок
     «Если ничего не помогает».
@@ -110,8 +101,6 @@ class SimplePhoneTranslator:
         )
         self.settings_btn.place(relx=1.0, x=-12, y=12, anchor="ne")
 
-        # Кнопка НАЧАТЬ всегда активна.
-        # Цвет меняется в _update_start_btn_state.
         self.start_btn = tk.Button(
             self.root, text="▶\nНАЧАТЬ", command=self.toggle_streaming,
             font=("Arial", 28, "bold"), bg="#607D8B", fg="white",
@@ -719,7 +708,6 @@ class SimplePhoneTranslator:
         help_text.tag_configure("ok", foreground="#4CAF50")
         help_text.tag_configure("warn", foreground="#FF9800")
 
-        # ИЗМЕНЕНО: убран «Шаг 4» и блок «Если ничего не помогает».
         lines = [
             ("h1", "Шаг 1. Включите отладку по USB на телефоне"),
             ("", "Откройте «Настройки» → «О телефоне» → 7 раз нажмите"),
@@ -786,56 +774,70 @@ class SimplePhoneTranslator:
             self._connect_window = None
 
     def _check_connect_and_maybe_close(self):
-        """Обновляет устройства; если появилось — закрывает окно."""
         self.refresh_devices_manual()
         if self.adb_ready and self.selected_device:
             self.log("✅ Устройство подключено")
             self._close_connect_window()
 
     # ============================================================
-    # УСТАНОВКА APK
+    # ВЕРСИОННЫЙ КОНТРОЛЬ APK (по хэшу)
     # ============================================================
 
-    def _install_android_app_async(self, on_done):
+    def _ensure_app_async(self, apk_path, known_hash, on_done):
         """
-        Запускает установку APK в фоновом потоке.
-        on_done(ok: bool, message: str) вызывается в UI-потоке.
+        Запускает ensure_app_installed в фоновом потоке.
+        on_done(ok: bool, action: str, message: str, new_hash: str)
+        — вызывается в UI-потоке.
         """
         if self._installing:
             return
         if not self.selected_device:
-            on_done(False, "Устройство не выбрано")
-            return
-
-        apk_path = adb_utils.get_apk_path()
-        if apk_path is None:
-            on_done(False, "APK-файл не найден рядом с приложением.\n"
-                           "Положите app-debug.apk рядом с main.py (или .exe).")
+            on_done(False, "error", "Устройство не выбрано", "")
             return
 
         self._installing = True
-        self.log(f"📦 Установка APK: {apk_path}")
+        self.log(f"📦 Проверка APK: {os.path.basename(apk_path)}")
         try:
-            self.start_btn.config(text="⏳\nУСТАНОВКА...", bg="#FF9800")
+            self.start_btn.config(text="⏳\nПРОВЕРКА...", bg="#FF9800")
         except Exception:
             pass
 
         def _worker():
-            ok, msg = adb_utils.install_android_app(
-                self.selected_device, apk_path, reinstall=True)
-            self.root.after(0, lambda: self._on_install_done(ok, msg, on_done))
+            ok, action, msg, new_hash = adb_utils.ensure_app_installed(
+                self.selected_device, apk_path, known_hash=known_hash)
+            self.root.after(0, lambda: self._on_ensure_done(
+                ok, action, msg, new_hash, on_done))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_install_done(self, ok, msg, on_done):
+    def _on_ensure_done(self, ok, action, msg, new_hash, on_done):
         self._installing = False
         self._update_start_btn_state()
+
+        # Сохраняем хэш после успешной установки
+        if ok and new_hash:
+            try:
+                changed = settings_manager.set(
+                    "last_installed_apk_hash", new_hash)
+                if changed:
+                    self.log(f"💾 Запомнен хэш APK: {new_hash[:12]}…")
+            except Exception:
+                pass
+
         if ok:
-            self.log("✅ APK установлен")
+            if action == "none":
+                self.log("✅ APK актуален — приложение не переустанавливалось")
+            elif action == "install":
+                self.log("✅ APK установлен")
+            elif action == "reinstall":
+                self.log("✅ APK обновлён (данные сохранены)")
+            elif action == "update":
+                self.log("✅ APK переустановлен (данные сброшены)")
         else:
-            self.log(f"❌ Ошибка установки APK: {msg[:200]}")
+            self.log(f"❌ Ошибка установки: {msg[:200]}")
+
         try:
-            on_done(ok, msg)
+            on_done(ok, action, msg, new_hash)
         except Exception:
             pass
 
@@ -851,14 +853,18 @@ class SimplePhoneTranslator:
 
     def start_streaming(self):
         """
-        Трёхступенчатая логика:
+        Логика:
           1) Нет ADB/устройства → окно с инструкцией.
-          2) Устройство есть, приложения нет → подтверждение + установка APK.
-          3) Всё готово → запуск трансляции.
+          2) Устройство есть → версионный контроль по SHA-256 хэшу:
+             • приложения нет          → диалог «Установить?»
+             • хэш APK == сохранённый  → тихий старт
+             • хэш отличается          → диалог «Обновить?»
+          3) После успешной проверки → запуск трансляции.
         """
         if self.streaming:
             return
 
+        # --- Шаг 1: ADB / устройство ---
         if not self.adb_ready or not self.selected_device:
             self._do_refresh(silent=True)
             if not self.adb_ready or not self.selected_device:
@@ -866,36 +872,72 @@ class SimplePhoneTranslator:
                 self._show_connect_instructions()
                 return
 
-        self.log("🔍 Проверка наличия приложения на устройстве...")
-        try:
-            installed = adb_utils.is_package_installed(
-                self.selected_device, adb_utils.ANDROID_PACKAGE)
-        except Exception as e:
-            self.log(f"⚠️ Ошибка проверки пакета: {e}")
-            installed = False
-
-        if installed:
-            self.log("✅ Приложение уже установлено")
-            self._start_streaming_after_checks()
+        # --- Шаг 2: APK ---
+        apk_path = adb_utils.get_apk_path()
+        if apk_path is None:
+            messagebox.showerror(
+                "APK не найден",
+                "APK-файл не найден рядом с приложением.\n\n"
+                "Положите app-debug.apk рядом с main.py (или .exe).",
+                parent=self.root,
+            )
             return
 
-        apk_path = adb_utils.get_apk_path()
-        apk_info = (f"\n\nAPK: {os.path.basename(apk_path)}"
-                    if apk_path else
-                    "\n\n⚠️ APK-файл не найден рядом с приложением.")
+        known_hash = str(
+            settings_manager.get("last_installed_apk_hash", "") or "")
+        apk_size_mb = os.path.getsize(apk_path) / (1024 * 1024)
 
+        installed = adb_utils.is_package_installed(
+            self.selected_device, adb_utils.ANDROID_PACKAGE)
+
+        if installed:
+            # Если хэш известен и совпадает — тихий старт
+            if known_hash:
+                current_hash = adb_utils.apk_sha256(apk_path)
+                if current_hash and current_hash == known_hash:
+                    self.log("✅ APK актуален — старт")
+                    self._start_streaming_after_checks()
+                    return
+
+            # Хэш отличается или неизвестен — спрашиваем
+            answer = messagebox.askyesno(
+                "Обновить приложение?",
+                f"APK-файл изменился (новый: {apk_size_mb:.1f} МБ).\n\n"
+                f"Обновить приложение на устройстве?",
+                parent=self.root,
+            )
+            if not answer:
+                self.log("ℹ️ Пользователь отказался от обновления — "
+                         "старт с текущей версией")
+                self._start_streaming_after_checks()
+                return
+
+            def _after_update(ok, action, msg, new_hash):
+                if ok:
+                    self._start_streaming_after_checks()
+                else:
+                    messagebox.showerror(
+                        "Ошибка обновления",
+                        f"Не удалось обновить APK:\n\n{msg}",
+                        parent=self.root,
+                    )
+
+            self._ensure_app_async(apk_path, known_hash, _after_update)
+            return
+
+        # Приложения нет — спрашиваем установку
         answer = messagebox.askyesno(
             "Установить приложение?",
-            "На Android-устройстве не найдено приложение "
-            "ScreenTranslator.\n\n"
-            "Установить его сейчас через ADB?" + apk_info,
+            f"На Android-устройстве не найдено приложение ScreenTranslator.\n\n"
+            f"APK: {apk_size_mb:.1f} МБ\n\n"
+            f"Установить его сейчас через ADB?",
             parent=self.root,
         )
         if not answer:
             self.log("ℹ️ Установка отменена пользователем")
             return
 
-        def _after_install(ok, msg):
+        def _after_install(ok, action, msg, new_hash):
             if ok:
                 self._start_streaming_after_checks()
             else:
@@ -905,7 +947,7 @@ class SimplePhoneTranslator:
                     parent=self.root,
                 )
 
-        self._install_android_app_async(_after_install)
+        self._ensure_app_async(apk_path, "", _after_install)
 
     def _start_streaming_after_checks(self):
         """Запуск трансляции после всех проверок и (опционально) установки."""
@@ -1215,7 +1257,8 @@ class SimplePhoneTranslator:
             ("===H2===", "2. Нажмите \"▶ НАЧАТЬ\""),
             ("", "Если устройство не подключено — откроется инструкция."),
             ("", "Если приложения нет — программа предложит установить APK."),
-            ("", "Если всё готово — запустится трансляция и перевод."),
+            ("", "Если APK изменился — предложит обновить."),
+            ("", "Если APK тот же — сразу запустится трансляция."),
             ("", ""),
             ("===H2===", "3. Перевод появится на ПК"),
             ("", "Поверх исходного окна появится перевод."),
