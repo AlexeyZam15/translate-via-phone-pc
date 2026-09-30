@@ -4,16 +4,12 @@
 ИЗМЕНЕНО:
   - При остановке трансляции или закрытии ПК-приложения
     автоматически останавливается Android-приложение (force-stop).
-  - Кнопка НАЧАТЬ всегда активна:
-      • нет устройства → показываем инструкцию по подключению;
-      • APK изменился    → диалог обновления;
-      • APK актуален     → сразу запуск трансляции.
-  - Версионный контроль по SHA-256 хэшу APK, без versionCode.
-    Собрал новый APK → положил в папку → при следующем НАЧАТЬ
-    программа сама предложит обновить.
-  - overlay_alpha по умолчанию = 0 (чёрный непрозрачный фон перевода).
-  - Из окна-инструкции по подключению убраны шаг 4 и блок
-    «Если ничего не помогает».
+  - Кнопка НАЧАТЬ всегда активна.
+  - Версионный контроль по SHA-256 хэшу APK.
+  - overlay_alpha по умолчанию = 0.
+  - УДАЛЕНО: настройка "Автоматический оконный режим без рамки"
+    и все упоминания о borderless fullscreen.
+  - Добавлен флаг _closing для идемпотентности on_closing.
 """
 
 import os
@@ -74,11 +70,10 @@ class SimplePhoneTranslator:
         self._auto_refresh_timer = None
         self._auto_refresh_interval_ms = 3000
 
-        # Флаг: уже отправили force-stop
         self._android_stopped = False
-
-        # Флаг: идёт установка APK
         self._installing = False
+
+        self._closing = False
 
         dbg.log_event("pc.simple_gui_init")
         self.create_widgets()
@@ -634,7 +629,6 @@ class SimplePhoneTranslator:
             pass
 
     def _update_start_btn_state(self):
-        """Кнопка НАЧАТЬ всегда активна. Меняем только цвет и текст."""
         if self.streaming:
             try:
                 self.start_btn.config(text="⏹\nОСТАНОВИТЬ", bg="#f44336")
@@ -658,7 +652,6 @@ class SimplePhoneTranslator:
     # ============================================================
 
     def _show_connect_instructions(self):
-        """Показывает окно с инструкцией по подключению Android-устройства."""
         if self._connect_window is not None:
             try:
                 if self._connect_window.winfo_exists():
@@ -784,11 +777,6 @@ class SimplePhoneTranslator:
     # ============================================================
 
     def _ensure_app_async(self, apk_path, known_hash, on_done):
-        """
-        Запускает ensure_app_installed в фоновом потоке.
-        on_done(ok: bool, action: str, message: str, new_hash: str)
-        — вызывается в UI-потоке.
-        """
         if self._installing:
             return
         if not self.selected_device:
@@ -796,9 +784,10 @@ class SimplePhoneTranslator:
             return
 
         self._installing = True
-        self.log(f"📦 Проверка APK: {os.path.basename(apk_path)}")
+        # ИЗМЕНЕНО: "Проверка APK" → "Установка APK".
+        self.log(f"📦 Установка APK: {os.path.basename(apk_path)}")
         try:
-            self.start_btn.config(text="⏳\nПРОВЕРКА...", bg="#FF9800")
+            self.start_btn.config(text="⏳\nУСТАНОВКА...", bg="#FF9800")
         except Exception:
             pass
 
@@ -814,7 +803,6 @@ class SimplePhoneTranslator:
         self._installing = False
         self._update_start_btn_state()
 
-        # Сохраняем хэш после успешной установки
         if ok and new_hash:
             try:
                 changed = settings_manager.set(
@@ -852,19 +840,9 @@ class SimplePhoneTranslator:
             self.start_streaming()
 
     def start_streaming(self):
-        """
-        Логика:
-          1) Нет ADB/устройства → окно с инструкцией.
-          2) Устройство есть → версионный контроль по SHA-256 хэшу:
-             • приложения нет          → диалог «Установить?»
-             • хэш APK == сохранённый  → тихий старт
-             • хэш отличается          → диалог «Обновить?»
-          3) После успешной проверки → запуск трансляции.
-        """
         if self.streaming:
             return
 
-        # --- Шаг 1: ADB / устройство ---
         if not self.adb_ready or not self.selected_device:
             self._do_refresh(silent=True)
             if not self.adb_ready or not self.selected_device:
@@ -872,7 +850,6 @@ class SimplePhoneTranslator:
                 self._show_connect_instructions()
                 return
 
-        # --- Шаг 2: APK ---
         apk_path = adb_utils.get_apk_path()
         if apk_path is None:
             messagebox.showerror(
@@ -891,7 +868,6 @@ class SimplePhoneTranslator:
             self.selected_device, adb_utils.ANDROID_PACKAGE)
 
         if installed:
-            # Если хэш известен и совпадает — тихий старт
             if known_hash:
                 current_hash = adb_utils.apk_sha256(apk_path)
                 if current_hash and current_hash == known_hash:
@@ -899,7 +875,6 @@ class SimplePhoneTranslator:
                     self._start_streaming_after_checks()
                     return
 
-            # Хэш отличается или неизвестен — спрашиваем
             answer = messagebox.askyesno(
                 "Обновить приложение?",
                 f"APK-файл изменился (новый: {apk_size_mb:.1f} МБ).\n\n"
@@ -925,7 +900,6 @@ class SimplePhoneTranslator:
             self._ensure_app_async(apk_path, known_hash, _after_update)
             return
 
-        # Приложения нет — спрашиваем установку
         answer = messagebox.askyesno(
             "Установить приложение?",
             f"На Android-устройстве не найдено приложение ScreenTranslator.\n\n"
@@ -950,7 +924,6 @@ class SimplePhoneTranslator:
         self._ensure_app_async(apk_path, "", _after_install)
 
     def _start_streaming_after_checks(self):
-        """Запуск трансляции после всех проверок и (опционально) установки."""
         self._reset_android_stopped_flag()
 
         if bool(settings_manager.get("auto_launch_android", True)):
@@ -1044,13 +1017,28 @@ class SimplePhoneTranslator:
             self.pc_streamer.set_our_hwnds(our_hwnds)
             self.pc_streamer.set_on_hwnd_changed(self.on_hwnd_changed)
 
-            self.ocr_overlay = OcrOverlayWindow(
-                self.root,
-                self.ocr_receiver,
-                target_hwnd=0,
-                pc_streamer=self.pc_streamer,
-                on_close=self.on_overlay_closed
-            )
+            # ИЗМЕНЕНО: проверяем, не создан ли уже оверлей.
+            # Если создан и окно существует — переиспользуем его,
+            # а не создаём новое. Это устраняет "несколько оверлеев".
+            if self.ocr_overlay is not None:
+                try:
+                    if self.ocr_overlay.window.winfo_exists():
+                        # Переиспользуем существующий оверлей
+                        self.ocr_overlay.set_target_hwnd(0)
+                        self.ocr_overlay.show()
+                    else:
+                        self.ocr_overlay = None
+                except Exception:
+                    self.ocr_overlay = None
+
+            if self.ocr_overlay is None:
+                self.ocr_overlay = OcrOverlayWindow(
+                    self.root,
+                    self.ocr_receiver,
+                    target_hwnd=0,
+                    pc_streamer=self.pc_streamer,
+                    on_close=self.on_overlay_closed
+                )
             our_hwnds = self._get_our_hwnds()
             self.pc_streamer.set_our_hwnds(our_hwnds)
 
@@ -1221,6 +1209,7 @@ class SimplePhoneTranslator:
                                 spacing1=8, spacing3=3)
         help_text.tag_configure("ok", foreground="#4CAF50")
         help_text.tag_configure("warn", foreground="#FF9800")
+        help_text.tag_configure("err", foreground="#F44336")
 
         self._insert_help_text(help_text)
         help_text.config(state=tk.DISABLED)
@@ -1269,6 +1258,42 @@ class SimplePhoneTranslator:
             ("", "При нажатии \"⏹ ОСТАНОВИТЬ\" или закрытии программы"),
             ("", "OCR на телефоне автоматически выключится."),
             ("", ""),
+            ("===H1===", "⚠️ Важные ограничения"),
+            ("", ""),
+            ("===H2===", "1. Захват только в режиме \"окно без рамки\""),
+            ("", "Программа не может корректно захватывать приложения,"),
+            ("", "работающие в эксклюзивном полноэкранном режиме"),
+            ("", "(DirectX/OpenGL). В этом случае захват даёт чёрный экран."),
+            ("", ""),
+            ("", "Решение: запускайте приложения в режиме \"окно без рамки\"."),
+            ("", "Автопереключение удалено из программы."),
+            ("", ""),
+            ("===H2===", "2. Права администратора: они должны СОВПАДАТЬ у обоих приложений"),
+            ("", ""),
+            ("===WARN===", "Это касается ОБОИХ приложений:"),
+            ("", "• нашей программы (которая захватывает экран),"),
+            ("", "• целевого приложения (игры, браузера, программы),"),
+            ("", "  окно которого мы захватываем."),
+            ("", ""),
+            ("", "В Windows действует защита UIPI (User Interface Privilege Isolation):"),
+            ("", "процесс с низкими правами НЕ МОЖЕТ захватить окно процесса"),
+            ("", "с более высокими правами. Проще говоря:"),
+            ("", ""),
+            ("===ERR===", "❌ Если целевое приложение запущено ОТ АДМИНИСТРАТОРА,"),
+            ("===ERR===", "   а наша программа — БЕЗ админа — будет ЧЁРНЫЙ ЭКРАН."),
+            ("", ""),
+            ("===OK===", "✅ Если права совпадают (оба с админом или оба без) — всё работает."),
+            ("", ""),
+            ("===H2===", "Что делать?"),
+            ("", "Вариант 1 (рекомендуется): запускайте ОБЕ программы БЕЗ админа."),
+            ("", "  Это безопаснее и работает в 90% случаев."),
+            ("", ""),
+            ("", "Вариант 2: если целевое приложение требует админа"),
+            ("", "  (например, некоторые игры с античитом или системные утилиты),"),
+            ("", "  тогда запустите и нашу программу от имени администратора."),
+            ("", ""),
+            ("===OK===", "Правило: права у обоих приложений должны быть ОДИНАКОВЫМИ."),
+            ("", ""),
             ("===H1===", "Настройки (шестерёнка ⚙)"),
             ("", ""),
             ("===H2===", "Автоматически запускать Android-приложение"),
@@ -1298,6 +1323,8 @@ class SimplePhoneTranslator:
                 text_widget.insert(tk.END, line + "\n", "warn")
             elif marker == "===OK===":
                 text_widget.insert(tk.END, line + "\n", "ok")
+            elif marker == "===ERR===":
+                text_widget.insert(tk.END, line + "\n", "err")
             else:
                 text_widget.insert(tk.END, line + "\n")
 
@@ -1306,6 +1333,10 @@ class SimplePhoneTranslator:
     # ============================================================
 
     def on_closing(self):
+        if getattr(self, '_closing', False):
+            return
+        self._closing = True
+
         dbg.log_event("pc.simple_gui_closing")
         self.log("👋 Завершение работы...")
 
@@ -1340,4 +1371,7 @@ class SimplePhoneTranslator:
 
         dbg.log_event("pc.simple_gui_closed")
         dbg.flush()
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass

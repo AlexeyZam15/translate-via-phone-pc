@@ -2,8 +2,17 @@
 """Отдельный лог распознанного и переведённого текста.
 
 Пишет в OCR_TEXT_LOG_FILE (ocr_text.log) рядом с main.py.
-Записи блокируются по хэшу: если текст/перевод не изменился —
-в файл ничего не пишется. Это даёт компактность без спама.
+
+ИЗМЕНЕНО:
+  - Файл ПЕРЕСОЗДАЁТСЯ при старте приложения (см. init_text_log()),
+    как debug.log и debug_timing.jsonl. Раньше дописывался в конец.
+  - Записи блокируются по хэшу: если текст/перевод не изменился —
+    в файл ничего не пишется. Это даёт компактность без спама.
+  - При пересоздании кэши хэшей сбрасываются, чтобы первая запись
+    в новом сеансе гарантированно произошла.
+  - log_translate_text НЕ пишет пары, где перевод совпадает с
+    оригиналом (Wii → Wii, Nintendo → Nintendo, EMBLEM → EMBLEM).
+    Это устраняет бесполезный мусор в логе.
 
 Формат:
   [HH:MM:SS] OCR (N blocks, mode=translate)
@@ -14,8 +23,8 @@
     <вход>  →  <выход>
     ...
 
-Потокобезопасен (Lock). Не ротируется — если файл станет большим,
-удалите вручную.
+Потокобезопасен (Lock). Не ротируется — файл обрезается только
+при старте приложения.
 """
 
 import hashlib
@@ -31,6 +40,27 @@ _lock = threading.Lock()
 _last_ocr_hash: Optional[str] = None
 # Хэш последнего записанного перевода
 _last_tr_hash: Optional[str] = None
+
+
+def init_text_log() -> None:
+    """Пересоздаёт ocr_text.log при старте приложения.
+
+    Обрезает файл (режим "w") и сбрасывает кэши хэшей, чтобы первая
+    запись в новом сеансе гарантированно произошла.
+
+    Вызывается из main.py сразу после инициализации debug-логгера.
+    """
+    global _last_ocr_hash, _last_tr_hash
+    if not OCR_TEXT_LOG_ENABLED:
+        return
+    with _lock:
+        try:
+            with open(OCR_TEXT_LOG_FILE, "w", encoding="utf-8"):
+                pass
+        except Exception:
+            pass
+        _last_ocr_hash = None
+        _last_tr_hash = None
 
 
 def _hash_ocr(blocks: List[dict], mode: str) -> str:
@@ -116,6 +146,10 @@ def log_translate_text(texts: List[str], translations: List[str]) -> None:
     """Пишет все пары вход→выход без обрезки.
 
     Блокирует по хэшу: если перевод не изменился — ничего не пишет.
+
+    ИЗМЕНЕНО: пары, где перевод совпадает с оригиналом
+    (Wii → Wii, Nintendo → Nintendo, EMBLEM → EMBLEM),
+    НЕ записываются. Сравнение регистронезависимое, с trim по краям.
     """
     global _last_tr_hash
 
@@ -130,8 +164,12 @@ def log_translate_text(texts: List[str], translations: List[str]) -> None:
         for i in range(n):
             src = (texts[i] or "").strip()
             dst = (translations[i] or "").strip()
-            if src and dst:
-                pairs.append((src, dst))
+            if not src or not dst:
+                continue
+            # ИЗМЕНЕНО: пропускаем пары, где перевод совпадает с оригиналом.
+            if src.lower() == dst.lower():
+                continue
+            pairs.append((src, dst))
         if not pairs:
             return
 

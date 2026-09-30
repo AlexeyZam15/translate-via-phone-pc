@@ -9,6 +9,9 @@ Android при старте делает GET /settings и применяет.
 При изменении настроек на Android — POST /settings, менеджер сохраняет.
 При изменении настроек в GUI — менеджер сохраняет и (опционально)
 отправляет на Android через ADB broadcast (см. adb_utils).
+
+ИЗМЕНЕНО: удалена проверка auto_windowed_fullscreen — настройка
+borderless fullscreen удалена из приложения.
 """
 
 import json
@@ -52,8 +55,6 @@ class SettingsManager:
         self._data: Dict[str, Any] = dict(DEFAULT_SETTINGS)
         self._listeners: List[Callable[[str, Any], None]] = []
         self.load()
-        # Явно сохраняем при инициализации — файл создаётся сразу
-        # при первом запуске, чтобы пользователь видел settings.json.
         self.save()
 
     # ------------------------------------------------------------
@@ -77,7 +78,6 @@ class SettingsManager:
                                 continue
                             if _is_valid_value(k, v):
                                 data[k] = v
-                            # иначе — оставляем дефолт из DEFAULT_SETTINGS
                 except Exception:
                     pass
             self._data = data

@@ -86,19 +86,42 @@ if __name__ == "__main__":
 
     from src.config import APP_DIR as _APP_DIR, DEBUG_LOG_FILE
     from src.debug_logger import logger as dbg
+    from src.text_logger import init_text_log
 
     dbg.log_event("pc.app_start", {
         "app_dir": _APP_DIR,
         "debug_log_file": DEBUG_LOG_FILE,
     })
 
+    # ИЗМЕНЕНО: ocr_text.log пересоздаётся при старте приложения,
+    # как debug.log и debug_timing.jsonl.
+    init_text_log()
+
     import tkinter as tk
     from src.simple_gui import SimplePhoneTranslator
 
+    app = None
+    root = None
     try:
         root = tk.Tk()
         app = SimplePhoneTranslator(root)
         root.mainloop()
+    except KeyboardInterrupt:
+        # ИЗМЕНЕНО: обработка Ctrl+C — корректное завершение приложения
+        print("\n⏹️ Получен Ctrl+C, завершаем работу...")
+        dbg.log_event("pc.app_keyboard_interrupt")
+        if app is not None:
+            try:
+                app.on_closing()
+            except Exception as e:
+                print(f"⚠️ Ошибка при завершении: {e}")
+        # on_closing уже вызывает root.destroy(), но на случай если
+        # он не дошёл до этого — пробуем ещё раз
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
     except Exception as e:
         dbg.log_event("pc.app_fatal", {"error": str(e)})
         raise

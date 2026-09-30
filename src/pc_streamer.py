@@ -9,6 +9,10 @@
   - setup_adb_reverse теперь ПАРАЛЛЕЛЬНЫЙ.
   - INTER_AREA вместо INTER_LINEAR — меньше артефактов на тексте
     при уменьшении окна (важно для OCR).
+  - capture_window_frame теперь захватывает КЛИЕНТСКУЮ область
+    окна (GetClientRect), а не всё окно (GetWindowRect).
+  - УДАЛЕНО: автопереключение окна в безрамочный режим
+    (borderless fullscreen). Теперь стример не трогает стили окна.
 """
 
 import cv2
@@ -26,6 +30,8 @@ import concurrent.futures
 
 import win32gui
 import win32ui
+import win32con
+import win32api
 
 from src.config import (
     PC_TO_PHONE_PORT,
@@ -40,6 +46,7 @@ from src.config import (
 )
 from src.debug_logger import logger as dbg
 from src import window_utils
+from src.settings_manager import settings_manager
 
 WINDOW_WATCH_INTERVAL = 0.3
 
@@ -188,20 +195,40 @@ class WindowStreamer:
             return False
 
     def capture_window_frame(self):
+        """
+        Захватывает КЛИЕНТСКУЮ область окна (без рамки и заголовка).
+
+        PrintWindow рисует всё окно в GDI-битмап размером win_w x win_h,
+        затем numpy-массив обрезается до client_w x client_h со смещением
+        (offset_x, offset_y). Это устраняет смещение OCR-зон, потому что
+        OcrOverlayWindow позиционируется именно по клиентской области.
+        """
         if not self.hwnd or not win32gui.IsWindow(self.hwnd):
             return None
 
         try:
-            rect = win32gui.GetWindowRect(self.hwnd)
+            window_rect = win32gui.GetWindowRect(self.hwnd)
+            client_rect = win32gui.GetClientRect(self.hwnd)
         except Exception:
             return None
 
-        width = rect[2] - rect[0]
-        height = rect[3] - rect[1]
-        if width <= 0 or height <= 0:
+        win_w = window_rect[2] - window_rect[0]
+        win_h = window_rect[3] - window_rect[1]
+        client_w = client_rect[2] - client_rect[0]
+        client_h = client_rect[3] - client_rect[1]
+
+        if win_w <= 0 or win_h <= 0 or client_w <= 0 or client_h <= 0:
             return None
 
-        if not self._ensure_gdi(width, height):
+        try:
+            client_left, client_top = win32gui.ClientToScreen(self.hwnd, (0, 0))
+        except Exception:
+            client_left, client_top = 0, 0
+
+        offset_x = client_left - window_rect[0]
+        offset_y = client_top - window_rect[1]
+
+        if not self._ensure_gdi(win_w, win_h):
             return None
 
         gdi = self._gdi
@@ -216,7 +243,9 @@ class WindowStreamer:
             return None
 
         if not result:
-            return self._capture_with_bitblt(width, height)
+            return self._capture_with_bitblt(
+                win_w, win_h, client_w, client_h, offset_x, offset_y
+            )
 
         try:
             bmpinfo = gdi['bitmap'].GetInfo()
@@ -228,25 +257,31 @@ class WindowStreamer:
         except Exception:
             return None
 
+        frame = frame[offset_y:offset_y + client_h, offset_x:offset_x + client_w]
+
         h, w = frame.shape[:2]
         if w > MAX_STREAM_WIDTH:
             scale = MAX_STREAM_WIDTH / w
             new_w = MAX_STREAM_WIDTH
             new_h = int(h * scale)
-            # ИЗМЕНЕНО: INTER_AREA — меньше артефактов на тексте
             frame = cv2.resize(frame, (new_w, new_h),
                                interpolation=cv2.INTER_AREA)
 
         return frame
 
-    def _capture_with_bitblt(self, width, height):
+    def _capture_with_bitblt(self, win_w, win_h, client_w, client_h,
+                             offset_x, offset_y):
+        """
+        Захват окна через BitBlt (fallback).
+        Возвращает КЛИЕНТСКУЮ область (обрезает по offset_x/offset_y).
+        """
         try:
             gdi = self._gdi
             hwnd_dc = win32gui.GetWindowDC(self.hwnd)
             try:
                 src_dc = win32ui.CreateDCFromHandle(hwnd_dc)
                 gdi['compatible_dc'].BitBlt(
-                    (0, 0), (width, height), src_dc, (0, 0), 0x00CC0020
+                    (0, 0), (win_w, win_h), src_dc, (0, 0), 0x00CC0020
                 )
 
                 bmpinfo = gdi['bitmap'].GetInfo()
@@ -256,12 +291,14 @@ class WindowStreamer:
                 img = img.reshape((bmpinfo['bmHeight'], bmpinfo['bmWidth'], 4))
                 frame = img[:, :, :3].copy()
 
+                frame = frame[offset_y:offset_y + client_h,
+                offset_x:offset_x + client_w]
+
                 h, w = frame.shape[:2]
                 if w > MAX_STREAM_WIDTH:
                     scale = MAX_STREAM_WIDTH / w
                     new_w = MAX_STREAM_WIDTH
                     new_h = int(h * scale)
-                    # ИЗМЕНЕНО: INTER_AREA
                     frame = cv2.resize(frame, (new_w, new_h),
                                        interpolation=cv2.INTER_AREA)
                 return frame
