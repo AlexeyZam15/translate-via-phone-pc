@@ -46,6 +46,13 @@
     _force_redraw = True и сбрасывается fingerprint, чтобы следующий
     _refresh гарантированно перерисовал (даже если STALE_DATA_TIMEOUT).
   - В destroy слушатель снимается.
+
+ИЗМЕНЕНО (фильтр цифровых блоков):
+  - Функция _is_digits_only_block УДАЛЕНА. Цифры и двоеточия
+    удаляются на Android в normalizeText → stripDigitsAndColons,
+    и на ПК уже приходит очищенный текст ("Time" вместо
+    "Time 38:17:16"). Пустые после очистки блоки отбрасываются
+    на Android по isEmpty.
 """
 
 import hashlib
@@ -277,17 +284,14 @@ class OcrOverlayWindow:
         self._poll_timer = None
         self._position_timer = None
 
-        # ИЗМЕНЕНО: для скрытия отдельных блоков под курсором.
-        # _block_tags        — {tag: (x1, y1, x2, y2)} в координатах canvas.
-        # _hidden_block_tags — какие блоки сейчас скрыты через state='hidden'.
+        # Для скрытия отдельных блоков под курсором.
         self._block_tags = {}
         self._hidden_block_tags = set()
 
-        # ИЗМЕНЕНО: флаг принудительной перерисовки при смене настроек.
+        # Флаг принудительной перерисовки при смене настроек.
         self._force_redraw = False
 
-        # ИЗМЕНЕНО: подписка на изменения настроек (ocr_padding и др.),
-        # чтобы перерисовывать оверлей даже без нового OCR-пакета.
+        # Подписка на изменения настроек.
         try:
             settings_manager.add_listener(self._on_settings_changed)
         except Exception:
@@ -353,7 +357,6 @@ class OcrOverlayWindow:
         self._stable_blocks = []
         self._empty_frame_streak = 0
 
-        # ИЗМЕНЕНО: сбрасываем теги блоков при смене окна.
         self._block_tags = {}
         self._hidden_block_tags = set()
 
@@ -532,10 +535,7 @@ class OcrOverlayWindow:
         return (fw, fh)
 
     def _refresh(self):
-        # ИЗМЕНЕНО: читаем и сбрасываем флаг принудительной перерисовки.
-        # Если он был установлен (например, изменился ocr_padding),
-        # пропускаем проверку STALE_DATA_TIMEOUT и гарантированно
-        # доходим до _redraw с текущими _stable_blocks.
+        # Читаем и сбрасываем флаг принудительной перерисовки.
         force = self._force_redraw
         self._force_redraw = False
 
@@ -788,8 +788,6 @@ class OcrOverlayWindow:
         scale_x = client_w / frame_w
         scale_y = client_h / frame_h
 
-        # ИЗМЕНЕНО: сбрасываем теги перед полной перерисовкой,
-        # чтобы _poll_cursor_over_blocks не работал с устаревшими tag'ами.
         self._block_tags = {}
         self._hidden_block_tags = set()
 
@@ -826,6 +824,7 @@ class OcrOverlayWindow:
             text = b.get('text', '')
             if not text or not has_letters(text):
                 continue
+
             bw = b.get('w', 0)
             bh = b.get('h', 0)
             if bw <= 0 or bh <= 0:
@@ -836,7 +835,6 @@ class OcrOverlayWindow:
             x2 = (b.get('x', 0) + bw) * scale_x
             y2 = (b.get('y', 0) + bh) * scale_y
 
-            # ИЗМЕНЕНО: каждому блоку — уникальный tag.
             tag = f"blk_{idx}"
 
             if fill_mode == "solid":
@@ -846,7 +844,6 @@ class OcrOverlayWindow:
                 create_rect(x1, y1, x2, y2, fill="#000000",
                             outline="", stipple=fill_mode, tags=(tag, "bg"))
 
-            # Текст рисуем с тем же tag'ом, чтобы скрывался вместе с фоном.
             self._draw_fitted_text_tagged(
                 text, x1 + 2, y1 + 2,
                 max(1, (x2 - x1) - 4), max(1, (y2 - y1) - 4), tag
@@ -1082,7 +1079,6 @@ class OcrOverlayWindow:
             pass
 
     def destroy(self):
-        # ИЗМЕНЕНО: снимаем слушателя настроек.
         try:
             settings_manager.remove_listener(self._on_settings_changed)
         except Exception:
