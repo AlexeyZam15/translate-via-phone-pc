@@ -10,8 +10,17 @@ Android при старте делает GET /settings и применяет.
 При изменении настроек в GUI — менеджер сохраняет и (опционально)
 отправляет на Android через ADB broadcast (см. adb_utils).
 
-ИЗМЕНЕНО: удалена проверка auto_windowed_fullscreen — настройка
-borderless fullscreen удалена из приложения.
+ИЗМЕНЕНО:
+  - Версионирование схемы settings.json. Поле "_schema_version"
+    пишется в файл в save() и НЕ отдаётся наружу через all()/to_json().
+  - В load(): если версия в файле не совпадает с текущей
+    SETTINGS_SCHEMA_VERSION — выполняется миграция: берутся дефолты
+    из DEFAULT_SETTINGS, переносятся только ключи из
+    SETTINGS_MIGRATION_PRESERVE_KEYS (например, last_installed_apk_hash),
+    файл перезаписывается.
+  - Это позволяет менять DEFAULT_SETTINGS (например, ocr_padding
+    по умолчанию 0 → 11) и гарантированно применять новые дефолты
+    на существующих установках БЕЗ ручной правки settings.json.
 """
 
 import json
@@ -22,9 +31,15 @@ from typing import Any, Callable, Dict, List
 from src.config import (
     SETTINGS_FILE,
     DEFAULT_SETTINGS,
+    SETTINGS_SCHEMA_VERSION,
+    SETTINGS_MIGRATION_PRESERVE_KEYS,
     TRANSLATE_PROFILES,
     LANGUAGES,
 )
+
+# Ключ версии схемы в JSON. Начинается с "_", чтобы визуально
+# отличать метаданные от пользовательских настроек.
+_SCHEMA_KEY = "_schema_version"
 
 
 def _is_valid_value(key: str, value: Any) -> bool:
@@ -43,6 +58,8 @@ def _is_valid_value(key: str, value: Any) -> bool:
         return isinstance(value, int) and 0 <= value <= 100
     if key in ("debug", "auto_launch_android"):
         return isinstance(value, bool)
+    if key == "last_installed_apk_hash":
+        return isinstance(value, str)
     return True
 
 
@@ -62,33 +79,78 @@ class SettingsManager:
     # ------------------------------------------------------------
 
     def load(self) -> None:
-        """Загружает settings.json.
+        """Загружает settings.json с учётом версии схемы.
 
-        Отсутствующие или невалидные ключи берёт из DEFAULT_SETTINGS.
+        - Файла нет: используем дефолты, версия схемы запишется в save().
+        - Файл есть, _schema_version совпадает: обычная загрузка.
+        - Файл есть, _schema_version не совпадает или отсутствует:
+          миграция — берём DEFAULT_SETTINGS, переносим ключи из
+          SETTINGS_MIGRATION_PRESERVE_KEYS, сохраняем.
         """
         with self._lock:
+            # Файла нет — дефолты, ничего не мигрируем.
+            if not os.path.exists(self._path):
+                self._data = dict(DEFAULT_SETTINGS)
+                return
+
+            raw: Dict[str, Any] = {}
+            try:
+                with open(self._path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    raw = loaded
+            except Exception:
+                # Файл битый — используем дефолты.
+                self._data = dict(DEFAULT_SETTINGS)
+                return
+
+            file_version = raw.get(_SCHEMA_KEY, 0)
+            try:
+                file_version = int(file_version)
+            except (TypeError, ValueError):
+                file_version = 0
+
+            if file_version != SETTINGS_SCHEMA_VERSION:
+                # Миграция схемы: новые дефолты, только preserve-ключи
+                # переносятся из старого файла.
+                migrated = dict(DEFAULT_SETTINGS)
+                for k in SETTINGS_MIGRATION_PRESERVE_KEYS:
+                    if k in raw and _is_valid_value(k, raw[k]):
+                        migrated[k] = raw[k]
+                self._data = migrated
+                print(
+                    f"[Settings] 🔄 Миграция схемы: "
+                    f"v{file_version} → v{SETTINGS_SCHEMA_VERSION}, "
+                    f"применены дефолты "
+                    f"({', '.join(k for k in DEFAULT_SETTINGS)})"
+                )
+                # save() запишет файл с новым _schema_version.
+                self.save()
+                return
+
+            # Версия совпадает — обычная загрузка.
             data = dict(DEFAULT_SETTINGS)
-            if os.path.exists(self._path):
-                try:
-                    with open(self._path, "r", encoding="utf-8") as f:
-                        loaded = json.load(f)
-                    if isinstance(loaded, dict):
-                        for k, v in loaded.items():
-                            if k not in DEFAULT_SETTINGS:
-                                continue
-                            if _is_valid_value(k, v):
-                                data[k] = v
-                except Exception:
-                    pass
+            for k, v in raw.items():
+                if k == _SCHEMA_KEY:
+                    continue
+                if k not in DEFAULT_SETTINGS:
+                    continue
+                if _is_valid_value(k, v):
+                    data[k] = v
             self._data = data
 
     def save(self) -> None:
-        """Сохраняет текущие настройки в settings.json."""
+        """Сохраняет текущие настройки в settings.json.
+
+        Всегда добавляет "_schema_version" с текущей версией схемы.
+        """
         with self._lock:
             try:
                 os.makedirs(os.path.dirname(self._path), exist_ok=True)
+                obj = dict(self._data)
+                obj[_SCHEMA_KEY] = SETTINGS_SCHEMA_VERSION
                 with open(self._path, "w", encoding="utf-8") as f:
-                    json.dump(self._data, f, ensure_ascii=False, indent=2)
+                    json.dump(obj, f, ensure_ascii=False, indent=2)
             except Exception:
                 pass
 
@@ -141,21 +203,28 @@ class SettingsManager:
         return changed
 
     def all(self) -> Dict[str, Any]:
+        """Возвращает пользовательские настройки (без _schema_version)."""
         with self._lock:
             return dict(self._data)
 
     def to_json(self) -> str:
+        """JSON без _schema_version — для отправки на Android."""
         with self._lock:
             return json.dumps(self._data, ensure_ascii=False)
 
     def from_json(self, text: str) -> None:
-        """Применяет настройки из JSON-строки (от Android)."""
+        """Применяет настройки из JSON-строки (от Android).
+
+        Поле _schema_version игнорируется.
+        """
         try:
             obj = json.loads(text)
         except Exception:
             return
         if not isinstance(obj, dict):
             return
+        # _schema_version не даём менять снаружи.
+        obj.pop(_SCHEMA_KEY, None)
         self.update(obj)
 
     def reset_to_defaults(self) -> List[str]:

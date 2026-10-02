@@ -2,6 +2,13 @@
 """
 Точка входа. Запускает упрощённый GUI translate_via_phone.
 Все модули лежат в папке src/.
+
+ИЗМЕНЕНО:
+  - В начале __main__ вызывается kill_other_instances() —
+    убивает все другие запущенные экземпляры приложения
+    ДО открытия debug.log и ДО создания tk.Tk().
+  - Это устраняет: несколько окон/оверлеев, конфликт портов,
+    обрезание debug.log вторым процессом.
 """
 
 import os
@@ -44,11 +51,6 @@ class _Tee:
                 pass
 
 
-_LOG_FILE = open(os.path.join(APP_DIR, "debug.log"), "w", encoding="utf-8")
-sys.stdout = _Tee(sys.__stdout__, _LOG_FILE)
-sys.stderr = _Tee(sys.__stderr__, _LOG_FILE)
-
-
 def check_dependencies():
     """Проверяет наличие обязательных библиотек. Возвращает True/False."""
     missing = []
@@ -81,8 +83,26 @@ if __name__ == "__main__":
     print("=" * 60)
     print()
 
+    # ИЗМЕНЕНО: убиваем другие экземпляры ДО открытия debug.log
+    # и ДО создания tk.Tk(). Иначе второй процесс обрежет debug.log
+    # (открывается в режиме "w") и создаст второй оверлей/окно.
+    try:
+        from src.singleton import kill_other_instances
+        killed = kill_other_instances()
+        if killed:
+            print(f"[Main] ✅ Завершено старых экземпляров: {killed}")
+            print()
+    except Exception as e:
+        # Не критично, если не удалось — продолжаем запуск.
+        print(f"[Main] ⚠️ Не удалось завершить старые экземпляры: {e}")
+        print()
+
     if not check_dependencies():
         sys.exit(1)
+
+    _LOG_FILE = open(os.path.join(APP_DIR, "debug.log"), "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, _LOG_FILE)
+    sys.stderr = _Tee(sys.__stderr__, _LOG_FILE)
 
     from src.config import APP_DIR as _APP_DIR, DEBUG_LOG_FILE
     from src.debug_logger import logger as dbg

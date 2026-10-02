@@ -30,6 +30,22 @@
   - SIZE_CHANGE_THRESHOLD = 5: размер обновляется при 5+ px.
   - STABLE_TEXT_UPDATE_THRESHOLD = 2 (было 8): текст обновляется
     через 2 кадра (~330 мс) вместо 8 (~1.3 сек).
+
+ИЗМЕНЕНО (скрытие отдельных блоков под курсором):
+  - Убрано скрытие всего окна через -alpha 0.0 / withdraw.
+  - Каждому блоку присваивается canvas-tag "blk_{idx}".
+  - _poll_cursor_over_blocks() каждые 100 мс пересчитывает,
+    какие блоки под курсором, и скрывает их через state='hidden'.
+    Ушедшие из-под курсора — возвращает state='normal'.
+  - _block_tags и _hidden_block_tags сбрасываются в _redraw
+    перед canvas.delete("all").
+
+ИЗМЕНЕНО (реакция на смену настроек):
+  - Подписка на settings_manager.add_listener.
+  - При изменении ocr_padding / debug / overlay_alpha выставляется
+    _force_redraw = True и сбрасывается fingerprint, чтобы следующий
+    _refresh гарантированно перерисовал (даже если STALE_DATA_TIMEOUT).
+  - В destroy слушатель снимается.
 """
 
 import hashlib
@@ -71,6 +87,10 @@ FRAME_SIZE_TOLERANCE = 0.05
 STALE_DATA_TIMEOUT = 2.0
 
 EMPTY_FRAME_STREAK_TO_CLEAR = 2
+
+# Ключи настроек, при изменении которых нужно принудительно
+# перерисовать оверлей (даже если нет нового OCR-пакета).
+_REDRAW_TRIGGER_KEYS = ("ocr_padding", "debug", "overlay_alpha")
 
 
 def _blocks_fingerprint(blocks) -> str:
@@ -257,9 +277,21 @@ class OcrOverlayWindow:
         self._poll_timer = None
         self._position_timer = None
 
-        self._is_mouse_over = False
+        # ИЗМЕНЕНО: для скрытия отдельных блоков под курсором.
+        # _block_tags        — {tag: (x1, y1, x2, y2)} в координатах canvas.
+        # _hidden_block_tags — какие блоки сейчас скрыты через state='hidden'.
+        self._block_tags = {}
+        self._hidden_block_tags = set()
 
-        self._force_redraw_on_show = True
+        # ИЗМЕНЕНО: флаг принудительной перерисовки при смене настроек.
+        self._force_redraw = False
+
+        # ИЗМЕНЕНО: подписка на изменения настроек (ocr_padding и др.),
+        # чтобы перерисовывать оверлей даже без нового OCR-пакета.
+        try:
+            settings_manager.add_listener(self._on_settings_changed)
+        except Exception:
+            pass
 
         dbg.log_event("pc.overlay_create", {"target_hwnd": target_hwnd})
         if target_hwnd:
@@ -272,10 +304,21 @@ class OcrOverlayWindow:
         self._poll()
         self._position_loop()
 
-        self.window.bind("<Enter>", self._on_mouse_enter)
-        self.window.bind("<Leave>", self._on_mouse_leave)
-        self.canvas.bind("<Enter>", self._on_mouse_enter)
-        self.canvas.bind("<Leave>", self._on_mouse_leave)
+    def _on_settings_changed(self, key, value):
+        """Реакция на изменение настроек из settings_manager.
+
+        При изменении визуальных параметров (ocr_padding, debug,
+        overlay_alpha) — выставляем _force_redraw и сбрасываем
+        fingerprint, чтобы следующий _refresh гарантированно
+        перерисовал оверлей.
+        """
+        if key not in _REDRAW_TRIGGER_KEYS:
+            return
+        self._force_redraw = True
+        self._last_fingerprint = None
+        self._last_ocr_padding = None
+        self._last_alpha = None
+        self._last_mode = None
 
     def _force_topmost(self):
         try:
@@ -295,29 +338,6 @@ class OcrOverlayWindow:
         except Exception:
             pass
 
-    def _on_mouse_enter(self, event):
-        if self._is_mouse_over:
-            return
-        self._is_mouse_over = True
-        try:
-            self.window.withdraw()
-        except Exception:
-            pass
-
-    def _on_mouse_leave(self, event):
-        if not self._is_mouse_over:
-            return
-        self._is_mouse_over = False
-        try:
-            self.window.deiconify()
-            self.window.lift()
-            self.window.attributes('-topmost', True)
-            self._force_topmost()
-            self._last_fingerprint = None
-            self._force_redraw_on_show = True
-        except Exception:
-            pass
-
     def set_target_hwnd(self, hwnd: int):
         if hwnd == self.target_hwnd:
             return
@@ -332,7 +352,11 @@ class OcrOverlayWindow:
         self._stable_frame_size = (0, 0)
         self._stable_blocks = []
         self._empty_frame_streak = 0
-        self._force_redraw_on_show = True
+
+        # ИЗМЕНЕНО: сбрасываем теги блоков при смене окна.
+        self._block_tags = {}
+        self._hidden_block_tags = set()
+
         try:
             self.canvas.delete("all")
         except Exception:
@@ -405,9 +429,8 @@ class OcrOverlayWindow:
                 pass
             self._force_topmost()
 
-            if was_withdrawn or self._force_redraw_on_show:
+            if was_withdrawn:
                 self._last_fingerprint = None
-                self._force_redraw_on_show = False
         except Exception as e:
             dbg.log_event("pc.overlay_set_pos_error", {"error": str(e)})
 
@@ -434,9 +457,61 @@ class OcrOverlayWindow:
                 "traceback": traceback.format_exc(),
             })
         try:
+            self._poll_cursor_over_blocks()
+        except Exception as e:
+            dbg.log_event("pc.overlay_poll_cursor_error", {"error": str(e)})
+        try:
             self._poll_timer = self.root.after(self.POLL_INTERVAL_MS, self._poll)
         except Exception:
             pass
+
+    def _poll_cursor_over_blocks(self):
+        """Скрывает блоки, над которыми сейчас курсор, показывает ушедшие.
+
+        Работает через canvas-теги: каждому блоку присвоен tag "blk_{idx}",
+        и прямоугольник фона, и текст имеют этот tag. itemconfigure
+        применяет state='hidden'/'normal' ко всем элементам с этим тегом.
+        """
+        if not self._block_tags:
+            if self._hidden_block_tags:
+                self._hidden_block_tags = set()
+            return
+
+        try:
+            if not self.window or not self.window.winfo_exists():
+                return
+            if self.window.state() == 'withdrawn':
+                return
+        except Exception:
+            return
+
+        try:
+            px, py = self.window.winfo_pointerxy()
+            wx = self.window.winfo_rootx()
+            wy = self.window.winfo_rooty()
+        except Exception:
+            return
+
+        lx = px - wx
+        ly = py - wy
+
+        now_hidden = set()
+        for tag, (x1, y1, x2, y2) in self._block_tags.items():
+            if x1 <= lx <= x2 and y1 <= ly <= y2:
+                now_hidden.add(tag)
+
+        if now_hidden == self._hidden_block_tags:
+            return
+
+        try:
+            for tag in now_hidden - self._hidden_block_tags:
+                self.canvas.itemconfigure(tag, state='hidden')
+            for tag in self._hidden_block_tags - now_hidden:
+                self.canvas.itemconfigure(tag, state='normal')
+        except Exception:
+            pass
+
+        self._hidden_block_tags = now_hidden
 
     def _stabilize_frame_size(self, fw: int, fh: int):
         if fw <= 0 or fh <= 0:
@@ -457,6 +532,13 @@ class OcrOverlayWindow:
         return (fw, fh)
 
     def _refresh(self):
+        # ИЗМЕНЕНО: читаем и сбрасываем флаг принудительной перерисовки.
+        # Если он был установлен (например, изменился ocr_padding),
+        # пропускаем проверку STALE_DATA_TIMEOUT и гарантированно
+        # доходим до _redraw с текущими _stable_blocks.
+        force = self._force_redraw
+        self._force_redraw = False
+
         if not self.target_hwnd:
             return
         if not win32gui.IsWindow(self.target_hwnd):
@@ -464,9 +546,10 @@ class OcrOverlayWindow:
         if win32gui.IsIconic(self.target_hwnd):
             return
 
-        last_ts = getattr(self.receiver, 'last_received_ts', 0.0)
-        if last_ts > 0 and (time.time() - last_ts) > STALE_DATA_TIMEOUT:
-            return
+        if not force:
+            last_ts = getattr(self.receiver, 'last_received_ts', 0.0)
+            if last_ts > 0 and (time.time() - last_ts) > STALE_DATA_TIMEOUT:
+                return
 
         blocks, (raw_fw, raw_fh) = self.receiver.get_blocks()
         mode = self.receiver.get_mode()
@@ -485,6 +568,8 @@ class OcrOverlayWindow:
                     self._stable_blocks = []
                     self._last_fingerprint = None
                     self.canvas.delete("all")
+                    self._block_tags = {}
+                    self._hidden_block_tags = set()
                     dbg.log_event("pc.overlay_cleared",
                                   {"reason": "empty_frames"})
             else:
@@ -504,6 +589,8 @@ class OcrOverlayWindow:
                           {"new_blocks": len(blocks)})
             self._last_fingerprint = None
             self.canvas.delete("all")
+            self._block_tags = {}
+            self._hidden_block_tags = set()
             self._stabilize_blocks(blocks)
 
         self._stable_blocks = _deduplicate_by_text(self._stable_blocks)
@@ -511,11 +598,8 @@ class OcrOverlayWindow:
 
         fp = _blocks_fingerprint(self._stable_blocks)
 
-        if self._force_redraw_on_show:
-            self._last_fingerprint = None
-            self._force_redraw_on_show = False
-
-        if (fp == self._last_fingerprint
+        if (not force
+                and fp == self._last_fingerprint
                 and mode == self._last_mode
                 and alpha == self._last_alpha
                 and (fw, fh) == self._last_frame_size
@@ -614,8 +698,6 @@ class OcrOverlayWindow:
                 pending_text = nb_text
                 pending_count = 1
 
-            # ИЗМЕНЕНО: STABLE_TEXT_UPDATE_THRESHOLD = 2.
-            # Обновление текста через 2 кадра.
             if pending_count >= STABLE_TEXT_UPDATE_THRESHOLD:
                 sb['text'] = nb_text
                 sb['confidence'] = nb_conf
@@ -706,6 +788,11 @@ class OcrOverlayWindow:
         scale_x = client_w / frame_w
         scale_y = client_h / frame_h
 
+        # ИЗМЕНЕНО: сбрасываем теги перед полной перерисовкой,
+        # чтобы _poll_cursor_over_blocks не работал с устаревшими tag'ами.
+        self._block_tags = {}
+        self._hidden_block_tags = set()
+
         self.canvas.delete("all")
 
         if mode == "debug":
@@ -734,9 +821,8 @@ class OcrOverlayWindow:
         fill_mode = self._stipple_from_alpha(alpha)
         create_rect = self.canvas.create_rectangle
         has_letters = self._has_letters
-        draw_text = self._draw_fitted_text
 
-        for b in blocks:
+        for idx, b in enumerate(blocks):
             text = b.get('text', '')
             if not text or not has_letters(text):
                 continue
@@ -750,15 +836,23 @@ class OcrOverlayWindow:
             x2 = (b.get('x', 0) + bw) * scale_x
             y2 = (b.get('y', 0) + bh) * scale_y
 
+            # ИЗМЕНЕНО: каждому блоку — уникальный tag.
+            tag = f"blk_{idx}"
+
             if fill_mode == "solid":
                 create_rect(x1, y1, x2, y2, fill="#000000",
-                            outline="", tags=("bg",))
+                            outline="", tags=(tag, "bg"))
             elif fill_mode is not None:
                 create_rect(x1, y1, x2, y2, fill="#000000",
-                            outline="", stipple=fill_mode, tags=("bg",))
+                            outline="", stipple=fill_mode, tags=(tag, "bg"))
 
-            draw_text(text, x1 + 2, y1 + 2,
-                      max(1, (x2 - x1) - 4), max(1, (y2 - y1) - 4))
+            # Текст рисуем с тем же tag'ом, чтобы скрывался вместе с фоном.
+            self._draw_fitted_text_tagged(
+                text, x1 + 2, y1 + 2,
+                max(1, (x2 - x1) - 4), max(1, (y2 - y1) - 4), tag
+            )
+
+            self._block_tags[tag] = (x1, y1, x2, y2)
 
     def _draw_debug(self, blocks, scale_x, scale_y, show_confidence=True,
                     ocr_padding=0):
@@ -880,6 +974,48 @@ class OcrOverlayWindow:
             return 0
         return max(SIZE_ROUND_TO, (v // SIZE_ROUND_TO) * SIZE_ROUND_TO)
 
+    def _draw_fitted_text_tagged(self, text, x, y, max_w, max_h, tag):
+        """Как _draw_fitted_text, но создаёт текст с указанным tag'ом."""
+        max_w = max(1, int(max_w))
+        max_h = max(1, int(max_h))
+
+        rounded_w = self._round_size(max_w)
+        rounded_h = self._round_size(max_h)
+
+        key = (text, rounded_w, rounded_h)
+        cached = self._fitted_cache.get(key)
+        if cached is not None:
+            size = cached
+        else:
+            size = min(self.MAX_FONT_SIZE, max_h)
+            size = max(size, self.MIN_FONT_SIZE)
+
+            while size > self.MIN_FONT_SIZE:
+                font = self._get_font(size)
+                item = self.canvas.create_text(
+                    x, y, text=text, fill="#ffffff", font=font,
+                    anchor="nw", width=max_w
+                )
+                bbox = self.canvas.bbox(item)
+                self.canvas.delete(item)
+                if bbox is None:
+                    size -= 1
+                    continue
+                text_h = bbox[3] - bbox[1]
+                if text_h <= max_h:
+                    break
+                size -= 1
+
+            if len(self._fitted_cache) > 2000:
+                self._fitted_cache.clear()
+            self._fitted_cache[key] = size
+
+        font = self._get_font(size)
+        self.canvas.create_text(
+            x, y, text=text, fill="#ffffff", font=font,
+            anchor="nw", width=max_w, tags=(tag,)
+        )
+
     def _draw_fitted_text(self, text, x, y, max_w, max_h):
         max_w = max(1, int(max_w))
         max_h = max(1, int(max_h))
@@ -942,11 +1078,16 @@ class OcrOverlayWindow:
             self.window.lift()
             self._force_topmost()
             self._last_fingerprint = None
-            self._force_redraw_on_show = True
         except Exception:
             pass
 
     def destroy(self):
+        # ИЗМЕНЕНО: снимаем слушателя настроек.
+        try:
+            settings_manager.remove_listener(self._on_settings_changed)
+        except Exception:
+            pass
+
         try:
             if self._poll_timer is not None:
                 self.root.after_cancel(self._poll_timer)
@@ -959,6 +1100,8 @@ class OcrOverlayWindow:
                 self._position_timer = None
         except Exception:
             pass
+        self._block_tags = {}
+        self._hidden_block_tags = set()
         try:
             self.window.destroy()
         except Exception:

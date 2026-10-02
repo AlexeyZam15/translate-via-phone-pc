@@ -34,6 +34,24 @@ OVERLAY_POLL_MS = 500
 # ======================== НАСТРОЙКИ ========================
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 
+# ИЗМЕНЕНО: версия схемы settings.json.
+# Поднимать вручную при ЛЮБОМ изменении DEFAULT_SETTINGS, иначе
+# на существующих установках останутся старые значения из файла
+# и новые дефолты не применятся.
+#
+# История:
+#   1 — исходная схема
+#   2 — ocr_padding по умолчанию 0 → 11
+SETTINGS_SCHEMA_VERSION = 2
+
+# Ключи из settings.json, которые НЕ сбрасываются при миграции
+# (сохраняются значения из файла, даже если версия схемы изменилась).
+# Здесь — то, что жалко терять: хэш последнего установленного APK,
+# чтобы не переустанавливать приложение при каждом обновлении.
+SETTINGS_MIGRATION_PRESERVE_KEYS = (
+    "last_installed_apk_hash",
+)
+
 # Профили качества перевода CTranslate2.
 TRANSLATE_PROFILES = ["speed", "balanced", "quality"]
 
@@ -70,7 +88,7 @@ DEFAULT_SETTINGS = {
     "debug": False,  # показать OCR-рамки
     "translate_profile": "balanced",  # speed / balanced / quality
     "confidence": 0,  # 0..100 (порог уверенности)
-    "ocr_padding": 0,  # 0..50 (отступ OCR, %)
+    "ocr_padding": 11,  # 0..50 (отступ OCR, %) — было 0, стало 11
     "overlay_alpha": 0,  # 0..100 (прозрачность фона перевода) — 0 = чёрный фон
     "source_lang": "auto",  # auto / en / ru / ...
     "target_lang": "ru",  # ru / en / ...
@@ -104,4 +122,4 @@ DEBUG_LOG_SKIP_STAGES = {
     "pc.encode_fps",
     "android.mjpeg_read_body",
     "android.mjpeg_frame_size_kb",
-}
+}   

@@ -507,20 +507,42 @@ def push_settings_to_android(serial: str,
                              settings_json: str,
                              package: str = ANDROID_PACKAGE,
                              silent: bool = True) -> bool:
-    """Отправляет настройки на Android через am broadcast."""
+    """Отправляет настройки на Android через am broadcast.
+
+    ИЗМЕНЕНО: JSON оборачивается в одинарные кавычки для shell
+    на Android, чтобы внутренние двойные кавычки и пробелы не
+    разбивались и не интерпретировались шеллом устройства.
+    Проверка ответа: ищем "Broadcast completed" или "Broadcast queued"
+    в stdout — иначе считаем отправку неуспешной.
+    """
     if not serial:
         return False
+
+    if settings_json is None:
+        settings_json = ""
+
+    # Экранируем одинарные кавычки внутри JSON: ' → '\''
+    # Оборачиваем всю строку в одинарные кавычки.
+    escaped = "'" + settings_json.replace("'", "'\\''") + "'"
+
     args = ["-s", serial, "shell", "am", "broadcast",
             "-a", f"{package}.SETTINGS",
-            "--es", "settings_json", settings_json]
+            "--es", "settings_json", escaped]
     result = _run_adb(args, timeout=10)
     if result is None:
         return False
     rc, out, err = result
-    ok = rc == 0
-    if not ok:
+
+    combined = (out or "") + "\n" + (err or "")
+    ok = (rc == 0) and (
+        "Broadcast completed" in combined
+        or "Broadcast queued" in combined
+    )
+
+    if ok:
+        if not silent:
+            print(f"[ADB] ✅ Настройки отправлены на Android")
+    else:
         print(f"[ADB] ⚠️ Не удалось отправить настройки: rc={rc}, "
-              f"err={err.strip()[:200]}")
-    elif not silent:
-        print(f"[ADB] ✅ Настройки отправлены на Android")
+              f"out={out.strip()[:200]}, err={err.strip()[:200]}")
     return ok
