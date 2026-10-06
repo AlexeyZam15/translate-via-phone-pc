@@ -2,12 +2,14 @@
 """HTTP-сервер перевода на CTranslate2 + Opus-MT.
 
 ИЗМЕНЕНО:
-  - Автонастройка intra_threads от физических ядер CPU.
-  - Параметры декодирования берутся из текущего профиля качества.
-  - Прогрев CTranslate2 при старте — первый реальный перевод быстрый.
+  - HTTPServer → ThreadingHTTPServer. Параллельные запросы
+    не ждут друг друга.
+  - _ct2_lock вокруг CTranslate2 translate_batch — движок
+    не thread-safe, вызовы сериализуются.
+  - log_translate_input(texts) — логирует вход переводчика.
+  - Параметры декодирования из профиля качества.
+  - Прогрев CTranslate2 при старте.
   - Кэш переводов (dict + Lock, максимум 5000 записей).
-  - Single-threaded HTTPServer.
-  - Пары вход→выход пишутся в ocr_text.log (только при изменении).
 """
 
 import json
@@ -16,7 +18,7 @@ import sys
 import threading
 import time
 import traceback
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from src.config import (
     PC_TRANSLATE_PORT,
@@ -25,7 +27,7 @@ from src.config import (
 )
 from src.settings_manager import settings_manager
 from src.debug_logger import logger as dbg
-from src.text_logger import log_translate_text
+from src.text_logger import log_translate_text, log_translate_input
 
 
 def _get_models_dir() -> str:
@@ -84,8 +86,6 @@ def _check_model_dir(path: str) -> bool:
 
 
 def _warmup_ctranslate2():
-    """Прогрев CTranslate2: фиктивный перевод, чтобы первый реальный
-    был быстрым."""
     if not _ct2_available or _ct2_translator is None:
         return
     if _sp_source is None or _sp_target is None:
@@ -93,12 +93,13 @@ def _warmup_ctranslate2():
     try:
         t0 = time.perf_counter()
         tokens = _sp_source.encode("hello world", out_type=str) + ["</s>"]
-        _ct2_translator.translate_batch(
-            [tokens],
-            beam_size=1, max_batch_size=1,
-            repetition_penalty=1.0, no_repeat_ngram_size=0,
-            max_decoding_length=16,
-        )
+        with _ct2_lock:
+            _ct2_translator.translate_batch(
+                [tokens],
+                beam_size=1, max_batch_size=1,
+                repetition_penalty=1.0, no_repeat_ngram_size=0,
+                max_decoding_length=16,
+            )
         ms = (time.perf_counter() - t0) * 1000.0
         print(f"[Translate-Server] ✅ CTranslate2 прогрет ({ms:.0f} мс)")
         dbg.log_event("pc.translate_server_warmup", {"ms": round(ms, 1)})
@@ -164,11 +165,15 @@ def _init_ctranslate2():
                            "default_profile": profile,
                            "cache_max": CACHE_MAX_SIZE})
 
-            _warmup_ctranslate2()
+            # Прогрев без удержания _ct2_lock (иначе _init и warmup — deadlock).
         except Exception as e:
             print(f"[Translate-Server] ❌ Ошибка загрузки модели: {e}")
             traceback.print_exc()
             dbg.log_event("pc.translate_server_ct2_error", {"error": str(e)})
+            return
+
+    # Прогрев вне _ct2_lock, чтобы не блокировать инициализацию.
+    _warmup_ctranslate2()
 
 
 def _cache_get(key):
@@ -220,14 +225,16 @@ def _translate_ct2(texts, source, target):
             tokens = _sp_source.encode(t, out_type=str) + ["</s>"]
             tokenized.append(tokens)
 
-        ct_results = _ct2_translator.translate_batch(
-            tokenized,
-            beam_size=beam_size,
-            max_batch_size=16,
-            repetition_penalty=rep_penalty,
-            no_repeat_ngram_size=no_repeat,
-            max_decoding_length=max_len,
-        )
+        # CTranslate2 не thread-safe — сериализуем вызовы.
+        with _ct2_lock:
+            ct_results = _ct2_translator.translate_batch(
+                tokenized,
+                beam_size=beam_size,
+                max_batch_size=16,
+                repetition_penalty=rep_penalty,
+                no_repeat_ngram_size=no_repeat,
+                max_decoding_length=max_len,
+            )
 
         for (idx, orig_text), r in zip(to_translate, ct_results):
             hyp = r.hypotheses[0] if r.hypotheses else []
@@ -245,7 +252,7 @@ def _translate_ct2(texts, source, target):
 
 
 class TranslateServer:
-    """HTTP-сервер перевода. Single-threaded."""
+    """HTTP-сервер перевода. ThreadingHTTPServer."""
 
     def __init__(self):
         self.server = None
@@ -289,6 +296,11 @@ class TranslateServer:
                         self._send_json({"translations": [], "engine": "none"})
                         return
 
+                    try:
+                        log_translate_input(texts)
+                    except Exception:
+                        pass
+
                     profile, _ = _get_profile_config()
 
                     translations = _translate_ct2(texts, source, target)
@@ -311,8 +323,6 @@ class TranslateServer:
                                    {"count": len(texts), "engine": engine,
                                     "profile": profile, "target": target})
 
-                    # ИЗМЕНЕНО: писать перевод в ocr_text.log
-                    # (только при изменении — блокировка по хэшу внутри)
                     if translations and engine == "ctranslate2":
                         log_translate_text(texts, translations)
 
@@ -335,14 +345,16 @@ class TranslateServer:
                 pass
 
         try:
-            self.server = HTTPServer(('0.0.0.0', port), Handler)
+            # ИЗМЕНЕНО: ThreadingHTTPServer вместо HTTPServer.
+            self.server = ThreadingHTTPServer(('0.0.0.0', port), Handler)
+            self.server.daemon_threads = True
             self.server_thread = threading.Thread(
                 target=self.server.serve_forever, daemon=True
             )
             self.server_thread.start()
             self.running = True
-            print(f"[Translate-Server] ✅ HTTP-сервер (single-threaded) запущен на порту {port}")
-            dbg.log_event("pc.translate_server_started", {"port": port, "threading": False})
+            print(f"[Translate-Server] ✅ HTTP-сервер (threading) запущен на порту {port}")
+            dbg.log_event("pc.translate_server_started", {"port": port, "threading": True})
             return True
         except Exception as e:
             print(f"[Translate-Server] ❌ Ошибка запуска: {e}")

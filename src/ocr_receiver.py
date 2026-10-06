@@ -5,6 +5,12 @@
 
 ИЗМЕНЕНО:
   - DebugReceiver фильтрует частые Android-стадии (_ANDROID_SKIP_STAGES).
+    Расширен список: убраны все частые стадии, которые оставались в логе
+    (ocr_zone_cache_stats, ocr_pass1, pc_ocr_recognize, ocr_total,
+    ocr_refine_blocks_count, pc_ocr_cycle_total, zone_cache_invalidated,
+    invalidate_on_padding, benchmark_ready_check, benchmark.is_ready,
+    benchmark.start/done/http, translator_ready/warmup/prepare/download,
+    mjpeg_start/connect_attempt/stop/reconnect, settings_loaded_from_pc).
   - OCR-блоки пишутся в ocr_text.log (только при изменении содержимого).
 """
 
@@ -21,18 +27,78 @@ from src.config import (
 from src.debug_logger import logger as dbg
 from src.text_logger import log_ocr_text
 
+# ИЗМЕНЕНО: расширен список skip-стадий.
+# Все частые android.* стадии не пишутся в debug_timing.jsonl,
+# чтобы файл не раздувался.
 _ANDROID_SKIP_STAGES = {
+    # MJPEG
     "android.mjpeg_read_body",
     "android.mjpeg_frame_size_kb",
     "android.mjpeg_connect",
     "android.mjpeg_connect_attempt",
+    "android.mjpeg_start",
+    "android.mjpeg_stop",
+    "android.mjpeg_reconnect",
+    "android.mjpeg_disconnect",
+    # OCR pass-стадии
     "android.pc_ocr_decode",
+    "android.pc_ocr_decode_failed",
     "android.ocr_pass1_blocks",
     "android.ocr_pass2_blocks",
     "android.ocr_pass2_skipped",
     "android.ocr_pass2",
+    "android.ocr_pass1",
+    "android.ocr_total",
+    "android.ocr_refine_blocks_count",
+    "android.ocr_zone_cache_stats",
+    "android.ocr_zone_cache_invalidated",
+    # PC OCR pipeline (дедуплицируется на Android)
+    "android.pc_ocr_pipeline",
+    "android.pc_ocr_pipeline_texts",
+    "android.pc_ocr_split_numbers",
+    "android.pc_ocr_split_single_letters",
+    "android.pc_ocr_skip_contained",
+    "android.pc_ocr_skip_overlap",
+    "android.pc_ocr_drop_fragment",
+    "android.pc_ocr_new_blocks",
+    "android.pc_ocr_replace_stale",
+    "android.pc_ocr_replace_contained",
+    "android.pc_ocr_no_translations",
+    "android.pc_ocr_recognize",
+    "android.pc_ocr_cycle_total",
+    "android.pc_ocr_invalidate_on_padding",
+    "android.pc_ocr_benchmark_ready_check",
+    "android.pc_ocr_worker_error",
+    # Sender
     "android.ocr_sender_build_json",
     "android.ocr_sender_http",
+    "android.ocr_sender_build_error",
+    "android.ocr_sender_error",
+    # Benchmark
+    "benchmark.is_ready",
+    "benchmark.start",
+    "benchmark.done",
+    "benchmark.http",
+    "benchmark.mlkit_ready",
+    "benchmark.mlkit_not_ready",
+    "benchmark.mlkit_prepare_error",
+    "benchmark.http_ping_ok",
+    "benchmark.http_ping_fail",
+    "benchmark.http_ping_late_ok",
+    "benchmark.http_ping_late_fail",
+    "benchmark.http_error",
+    "benchmark.mlkit_error",
+    # Translator
+    "android.translator_ready",
+    "android.translator_warmup",
+    "android.translator_prepare",
+    "android.translator_download_models",
+    "android.translator_detect_lang",
+    "android.translator_detect_lang_batch",
+    "android.translator_translate_all_total",
+    # Settings
+    "android.settings_loaded_from_pc",
+    "android.settings_load_from_pc_failed",
 }
 
 
@@ -143,8 +209,6 @@ class OcrReceiver:
                                 f"{len(blocks)} blocks, "
                                 f"frame={fw}x{fh}, mode={mode}"
                             )
-                            # ИЗМЕНЕНО: писать текст в ocr_text.log
-                            # (только при изменении содержимого)
                             log_ocr_text(blocks, mode=mode)
 
                     total_ms = (time.perf_counter() - t_start) * 1000.0

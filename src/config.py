@@ -21,7 +21,6 @@ PC_TRANSLATE_PORT = 5008  # HTTP-сервер перевода (CTranslate2)
 PC_SETTINGS_PORT = 5009  # HTTP-сервер настроек (синхронизация с Android)
 
 # --- Параметры стрима ---
-# FPS не важен для OCR — важно качество картинки.
 FPS = 6
 JPEG_QUALITY = 95
 MAX_STREAM_WIDTH = 1920
@@ -35,19 +34,8 @@ OVERLAY_POLL_MS = 500
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 
 # ИЗМЕНЕНО: версия схемы settings.json.
-# Поднимать вручную при ЛЮБОМ изменении DEFAULT_SETTINGS, иначе
-# на существующих установках останутся старые значения из файла
-# и новые дефолты не применятся.
-#
-# История:
-#   1 — исходная схема
-#   2 — ocr_padding по умолчанию 0 → 11
 SETTINGS_SCHEMA_VERSION = 2
 
-# Ключи из settings.json, которые НЕ сбрасываются при миграции
-# (сохраняются значения из файла, даже если версия схемы изменилась).
-# Здесь — то, что жалко терять: хэш последнего установленного APK,
-# чтобы не переустанавливать приложение при каждом обновлении.
 SETTINGS_MIGRATION_PRESERVE_KEYS = (
     "last_installed_apk_hash",
 )
@@ -82,20 +70,15 @@ TRANSLATE_PROFILE_LABELS = {
     "quality": "Качество",
 }
 
-# Значения по умолчанию. Источник истины — этот словарь.
-# Android при старте забирает эти значения с ПК через GET /settings.
 DEFAULT_SETTINGS = {
-    "debug": False,  # показать OCR-рамки
-    "translate_profile": "balanced",  # speed / balanced / quality
-    "confidence": 0,  # 0..100 (порог уверенности)
-    "ocr_padding": 11,  # 0..50 (отступ OCR, %) — было 0, стало 11
-    "overlay_alpha": 0,  # 0..100 (прозрачность фона перевода) — 0 = чёрный фон
-    "source_lang": "auto",  # auto / en / ru / ...
-    "target_lang": "ru",  # ru / en / ...
-    "auto_launch_android": True,  # автоматически запускать Android-приложение
-    # SHA-256 последнего APK, успешно установленного на телефон.
-    # Используется для версионного контроля: если хэш APK из папки
-    # не совпадает с сохранённым — предлагается переустановка.
+    "debug": False,
+    "translate_profile": "balanced",
+    "confidence": 0,
+    "ocr_padding": 11,
+    "overlay_alpha": 0,
+    "source_lang": "auto",
+    "target_lang": "ru",
+    "auto_launch_android": True,
     "last_installed_apk_hash": "",
 }
 
@@ -113,13 +96,27 @@ DEBUG_VERBOSE = False
 
 DEBUG_AGGREGATE_WINDOW_SEC = 5.0
 
+# ИЗМЕНЕНО: расширен список skip-стадий для ПК.
+# Частые технические события (ocr_total, ocr_parse_json,
+# ocr_receive_http, translate_server, settings_received)
+# не пишутся в debug_timing.jsonl, чтобы файл не раздувался.
 DEBUG_LOG_SKIP_STAGES = {
+    # Capture / encode
     "pc.capture_frame",
     "pc.encode_raw_copy",
     "pc.encode_jpeg",
     "pc.encode_jpeg_size_kb",
     "pc.capture_fps",
     "pc.encode_fps",
+    # Android MJPEG (дублируется из Android-фильтра)
     "android.mjpeg_read_body",
     "android.mjpeg_frame_size_kb",
-}   
+    # PC OCR (пишется на каждом кадре, агрегат не нужен)
+    "pc.ocr_receive_http",
+    "pc.ocr_parse_json",
+    "pc.ocr_total",
+    # Translate server (пишется на каждый запрос)
+    "pc.translate_server",
+    # Settings (пишется при каждом изменении)
+    "pc.settings_received",
+}

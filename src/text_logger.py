@@ -4,27 +4,14 @@
 Пишет в OCR_TEXT_LOG_FILE (ocr_text.log) рядом с main.py.
 
 ИЗМЕНЕНО:
-  - Файл ПЕРЕСОЗДАЁТСЯ при старте приложения (см. init_text_log()),
-    как debug.log и debug_timing.jsonl. Раньше дописывался в конец.
-  - Записи блокируются по хэшу: если текст/перевод не изменился —
-    в файл ничего не пишется. Это даёт компактность без спама.
-  - При пересоздании кэши хэшей сбрасываются, чтобы первая запись
-    в новом сеансе гарантированно произошла.
-  - log_translate_text НЕ пишет пары, где перевод совпадает с
-    оригиналом (Wii → Wii, Nintendo → Nintendo, EMBLEM → EMBLEM).
-    Это устраняет бесполезный мусор в логе.
-
-Формат:
-  [HH:MM:SS] OCR (N blocks, mode=translate)
-    [1] <полный текст блока 1>
-    [2] <полный текст блока 2>
-    ...
-  [HH:MM:SS] TR
-    <вход>  →  <выход>
-    ...
-
-Потокобезопасен (Lock). Не ротируется — файл обрезается только
-при старте приложения.
+  - Добавлена log_translate_input(texts) — логирует ВХОД
+    переводчика (то, что Android прислал на /translate).
+    Это позволяет увидеть, что именно уходит в CTranslate2,
+    и отличить проблему OCR от проблемы перевода.
+  - Файл ПЕРЕСОЗДАЁТСЯ при старте приложения (init_text_log).
+  - Записи блокируются по хэшу.
+  - log_translate_text НЕ пишет пары, где перевод совпадает
+    с оригиналом.
 """
 
 import hashlib
@@ -36,21 +23,14 @@ from src.config import OCR_TEXT_LOG_FILE, OCR_TEXT_LOG_ENABLED
 
 _lock = threading.Lock()
 
-# Хэш последнего записанного OCR-состояния
 _last_ocr_hash: Optional[str] = None
-# Хэш последнего записанного перевода
-_last_tr_hash: Optional[str] = None
+_last_tr_input_hash: Optional[str] = None
+_last_tr_output_hash: Optional[str] = None
 
 
 def init_text_log() -> None:
-    """Пересоздаёт ocr_text.log при старте приложения.
-
-    Обрезает файл (режим "w") и сбрасывает кэши хэшей, чтобы первая
-    запись в новом сеансе гарантированно произошла.
-
-    Вызывается из main.py сразу после инициализации debug-логгера.
-    """
-    global _last_ocr_hash, _last_tr_hash
+    """Пересоздаёт ocr_text.log при старте приложения."""
+    global _last_ocr_hash, _last_tr_input_hash, _last_tr_output_hash
     if not OCR_TEXT_LOG_ENABLED:
         return
     with _lock:
@@ -60,7 +40,8 @@ def init_text_log() -> None:
         except Exception:
             pass
         _last_ocr_hash = None
-        _last_tr_hash = None
+        _last_tr_input_hash = None
+        _last_tr_output_hash = None
 
 
 def _hash_ocr(blocks: List[dict], mode: str) -> str:
@@ -79,6 +60,14 @@ def _hash_ocr(blocks: List[dict], mode: str) -> str:
         h.update(b",")
         h.update(str(b.get("h", 0)).encode())
         h.update(b";")
+    return h.hexdigest()
+
+
+def _hash_texts(texts: List[str]) -> str:
+    h = hashlib.md5()
+    for t in texts:
+        h.update((t or "").encode("utf-8", errors="ignore"))
+        h.update(b"|")
     return h.hexdigest()
 
 
@@ -102,11 +91,7 @@ def _append(text: str) -> None:
 
 
 def log_ocr_text(blocks: List[dict], mode: str = "translate") -> None:
-    """Пишет все блоки OCR без обрезки.
-
-    Блокирует по хэшу: если набор блоков/текстов/координат не изменился —
-    ничего не пишет.
-    """
+    """Пишет все блоки OCR без обрезки. Блокирует по хэшу."""
     global _last_ocr_hash
 
     if not OCR_TEXT_LOG_ENABLED:
@@ -115,7 +100,6 @@ def log_ocr_text(blocks: List[dict], mode: str = "translate") -> None:
         return
 
     try:
-        # Отфильтровываем пустые тексты
         items = []
         for b in blocks:
             t = (b.get("text") or "").strip()
@@ -133,8 +117,43 @@ def log_ocr_text(blocks: List[dict], mode: str = "translate") -> None:
         ts = time.strftime("%H:%M:%S")
         lines = [f"[{ts}] OCR ({len(items)} blocks, mode={mode})\n"]
         for i, t in enumerate(items, 1):
-            # Полный текст блока, без обрезки. Многострочный текст —
-            # оставляем как есть, чтобы было видно структуру.
+            lines.append(f"  [{i}] {t}\n")
+        lines.append("\n")
+        _append("".join(lines))
+    except Exception:
+        pass
+
+
+def log_translate_input(texts: List[str]) -> None:
+    """
+    ИЗМЕНЕНО: логирует ВХОД переводчика — то, что Android
+    прислал на /translate. Блокирует по хэшу.
+    """
+    global _last_tr_input_hash
+
+    if not OCR_TEXT_LOG_ENABLED:
+        return
+    if not texts:
+        return
+
+    try:
+        items = []
+        for t in texts:
+            s = (t or "").strip()
+            if s:
+                items.append(s)
+        if not items:
+            return
+
+        fp = _hash_texts(items)
+        with _lock:
+            if fp == _last_tr_input_hash:
+                return
+            _last_tr_input_hash = fp
+
+        ts = time.strftime("%H:%M:%S")
+        lines = [f"[{ts}] TR-IN ({len(items)} texts)\n"]
+        for i, t in enumerate(items, 1):
             lines.append(f"  [{i}] {t}\n")
         lines.append("\n")
         _append("".join(lines))
@@ -143,15 +162,8 @@ def log_ocr_text(blocks: List[dict], mode: str = "translate") -> None:
 
 
 def log_translate_text(texts: List[str], translations: List[str]) -> None:
-    """Пишет все пары вход→выход без обрезки.
-
-    Блокирует по хэшу: если перевод не изменился — ничего не пишет.
-
-    ИЗМЕНЕНО: пары, где перевод совпадает с оригиналом
-    (Wii → Wii, Nintendo → Nintendo, EMBLEM → EMBLEM),
-    НЕ записываются. Сравнение регистронезависимое, с trim по краям.
-    """
-    global _last_tr_hash
+    """Пишет все пары вход→выход без обрезки. Блокирует по хэшу."""
+    global _last_tr_output_hash
 
     if not OCR_TEXT_LOG_ENABLED:
         return
@@ -166,7 +178,6 @@ def log_translate_text(texts: List[str], translations: List[str]) -> None:
             dst = (translations[i] or "").strip()
             if not src or not dst:
                 continue
-            # ИЗМЕНЕНО: пропускаем пары, где перевод совпадает с оригиналом.
             if src.lower() == dst.lower():
                 continue
             pairs.append((src, dst))
@@ -175,12 +186,12 @@ def log_translate_text(texts: List[str], translations: List[str]) -> None:
 
         fp = _hash_tr(texts, translations)
         with _lock:
-            if fp == _last_tr_hash:
+            if fp == _last_tr_output_hash:
                 return
-            _last_tr_hash = fp
+            _last_tr_output_hash = fp
 
         ts = time.strftime("%H:%M:%S")
-        lines = [f"[{ts}] TR\n"]
+        lines = [f"[{ts}] TR-OUT\n"]
         for src, dst in pairs:
             lines.append(f"  {src}  →  {dst}\n")
         lines.append("\n")
@@ -190,14 +201,13 @@ def log_translate_text(texts: List[str], translations: List[str]) -> None:
 
 
 def reset_ocr_cache() -> None:
-    """Сбрасывает кэш хэшей OCR (например, при смене режима/настроек)."""
     global _last_ocr_hash
     with _lock:
         _last_ocr_hash = None
 
 
 def reset_translate_cache() -> None:
-    """Сбрасывает кэш хэшей перевода."""
-    global _last_tr_hash
+    global _last_tr_input_hash, _last_tr_output_hash
     with _lock:
-        _last_tr_hash = None
+        _last_tr_input_hash = None
+        _last_tr_output_hash = None

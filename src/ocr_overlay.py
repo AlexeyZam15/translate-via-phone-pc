@@ -1,58 +1,15 @@
 # src/ocr_overlay.py
 """Прозрачный оверлей поверх исходного окна ПК.
 
-Показывает только текст перевода (и фон под ним),
-не дублирует кадр ПК. Позиция и размер = клиентская область
-исходного окна (target_hwnd).
-
-Поддерживает динамическую смену целевого окна (set_target_hwnd).
-
-Прозрачность фона управляется параметром alpha (0..255):
-  alpha >= 240  — фон полностью непрозрачный (сплошная заливка)
-  alpha <= 15   — фон полностью прозрачный (не рисуется)
-  иначе         — фон рисуется через stipple с градацией
-
-Стабилизация блоков:
-  Блок фиксируется при первом появлении и держит позицию, пока
-  находится на том же месте. Сопоставление нового блока со старым
-  идёт по IoU (Intersection over Union) прямоугольников.
-
-  Текст в стабильном блоке обновляется в двух случаях:
-    1. Новый текст точно совпадает со старым.
-    2. Новый текст отличается, но приходит STABLE_TEXT_UPDATE_THRESHOLD
-       раз подряд (гистерезис) — реальная смена на экране.
-
 ИЗМЕНЕНО:
-  - STABLE_MISS_LIMIT = 2: блок держится 2 кадра после исчезновения.
-  - miss_count УМЕНЬШАЕТСЯ при совпадении, а не сбрасывается в 0.
-  - При scene_changed очищается self._stable_blocks.
-  - POS_CHANGE_THRESHOLD = 3: позиция обновляется при сдвиге 3+ px.
-  - SIZE_CHANGE_THRESHOLD = 5: размер обновляется при 5+ px.
-  - STABLE_TEXT_UPDATE_THRESHOLD = 2 (было 8): текст обновляется
-    через 2 кадра (~330 мс) вместо 8 (~1.3 сек).
-
-ИЗМЕНЕНО (скрытие отдельных блоков под курсором):
-  - Убрано скрытие всего окна через -alpha 0.0 / withdraw.
-  - Каждому блоку присваивается canvas-tag "blk_{idx}".
-  - _poll_cursor_over_blocks() каждые 100 мс пересчитывает,
-    какие блоки под курсором, и скрывает их через state='hidden'.
-    Ушедшие из-под курсора — возвращает state='normal'.
-  - _block_tags и _hidden_block_tags сбрасываются в _redraw
-    перед canvas.delete("all").
-
-ИЗМЕНЕНО (реакция на смену настроек):
-  - Подписка на settings_manager.add_listener.
-  - При изменении ocr_padding / debug / overlay_alpha выставляется
-    _force_redraw = True и сбрасывается fingerprint, чтобы следующий
-    _refresh гарантированно перерисовал (даже если STALE_DATA_TIMEOUT).
-  - В destroy слушатель снимается.
-
-ИЗМЕНЕНО (фильтр цифровых блоков):
-  - Функция _is_digits_only_block УДАЛЕНА. Цифры и двоеточия
-    удаляются на Android в normalizeText → stripDigitsAndColons,
-    и на ПК уже приходит очищенный текст ("Time" вместо
-    "Time 38:17:16"). Пустые после очистки блоки отбрасываются
-    на Android по isEmpty.
+  - MIN_BLOCK_AREA = 4000. Блоки с площадью bbox меньше
+    не рисуются. Отсеивает мелкие "Speed:", "Max:", "Wii".
+  - POLL_INTERVAL_MS = 30.
+  - STABLE_TEXT_UPDATE_THRESHOLD = 1.
+  - BBOX_SETTLE_FRAMES = 1.
+  - POS_CHANGE_THRESHOLD = 10, SIZE_CHANGE_THRESHOLD = 15.
+  - Убран _detect_merge_split.
+  - _is_suspicious_text отсеивает мусорный перевод.
 """
 
 import hashlib
@@ -74,30 +31,65 @@ TRANSPARENT_COLOR = "#010101"
 ALPHA_SOLID_THRESHOLD = 240
 ALPHA_TRANSPARENT_THRESHOLD = 15
 
-STABLE_MISS_LIMIT = 2
+STABLE_MISS_LIMIT = 20
 
-# ИЗМЕНЕНО: 8 → 2. Обновление текста через 2 кадра (~330 мс),
-# а не через 8 (~1.3 сек). Устраняет "зависание" старого текста.
-STABLE_TEXT_UPDATE_THRESHOLD = 2
+STABLE_TEXT_UPDATE_THRESHOLD = 1
 
-STABLE_IOU_THRESHOLD = 0.3
+STABLE_IOU_THRESHOLD = 0.2
 
 DEDUP_IOU_THRESHOLD = 0.8
 DEDUP_TEXT_MAX_DIST = 30.0
 
-SIZE_CHANGE_THRESHOLD = 5
-POS_CHANGE_THRESHOLD = 3
+SIZE_CHANGE_THRESHOLD = 15
+POS_CHANGE_THRESHOLD = 10
+
+BBOX_SETTLE_FRAMES = 1
+
 CENTER_MATCH_DIST = 60.0
 SIZE_ROUND_TO = 8
 FRAME_SIZE_TOLERANCE = 0.05
 
-STALE_DATA_TIMEOUT = 2.0
+STALE_DATA_TIMEOUT = 3.0
 
 EMPTY_FRAME_STREAK_TO_CLEAR = 2
 
-# Ключи настроек, при изменении которых нужно принудительно
-# перерисовать оверлей (даже если нет нового OCR-пакета).
 _REDRAW_TRIGGER_KEYS = ("ocr_padding", "debug", "overlay_alpha")
+
+# ИЗМЕНЕНО: минимальная площадь bbox блока. Меньше — не рисуем.
+MIN_BLOCK_AREA = 4000
+
+RARE_CHARS = set(
+    "şŞţŢģĢżŻýÝþÞðÐłŁńŃćĆęĘąĄśŚźŹğĞıİřŘěĚůŮžŽ"
+    "áÁéÉíÍóÓúÚäÄöÖüÜßçÇñÑõÕãÃåÅæÆøØđĐħĦĸŀŉŧŦ"
+    "ƀƃƈƌƒƙƚƞơƠưƯƴƵǆǉǌǎǏǒǔǖǘǚǜșȘțȚȝ"
+)
+
+MAX_RARE_CHARS = 2
+MAX_CONSECUTIVE_CONSONANTS = 5
+
+VOWELS = set("aeiouyAEIOUYаеёиоуыэюяАЕЁИОУЫЭЮЯ")
+
+
+def _is_suspicious_text(text: str) -> bool:
+    """Отсеивает мусорный текст (редкие символы, 5+ согласных подряд)."""
+    if not text:
+        return True
+    rare_count = 0
+    for c in text:
+        if c in RARE_CHARS:
+            rare_count += 1
+            if rare_count > MAX_RARE_CHARS:
+                return True
+    for word in text.split():
+        consecutive = 0
+        for c in word:
+            if c.isalpha() and c not in VOWELS:
+                consecutive += 1
+                if consecutive >= MAX_CONSECUTIVE_CONSONANTS:
+                    return True
+            else:
+                consecutive = 0
+    return False
 
 
 def _blocks_fingerprint(blocks) -> str:
@@ -231,7 +223,9 @@ class OcrOverlayWindow:
 
     MIN_FONT_SIZE = 6
     MAX_FONT_SIZE = 72
-    POLL_INTERVAL_MS = 100
+
+    POLL_INTERVAL_MS = 30
+
     POSITION_INTERVAL_MS = 250
 
     def __init__(self, root, receiver: OcrReceiver, target_hwnd: int,
@@ -284,14 +278,11 @@ class OcrOverlayWindow:
         self._poll_timer = None
         self._position_timer = None
 
-        # Для скрытия отдельных блоков под курсором.
         self._block_tags = {}
         self._hidden_block_tags = set()
 
-        # Флаг принудительной перерисовки при смене настроек.
         self._force_redraw = False
 
-        # Подписка на изменения настроек.
         try:
             settings_manager.add_listener(self._on_settings_changed)
         except Exception:
@@ -309,13 +300,6 @@ class OcrOverlayWindow:
         self._position_loop()
 
     def _on_settings_changed(self, key, value):
-        """Реакция на изменение настроек из settings_manager.
-
-        При изменении визуальных параметров (ocr_padding, debug,
-        overlay_alpha) — выставляем _force_redraw и сбрасываем
-        fingerprint, чтобы следующий _refresh гарантированно
-        перерисовал оверлей.
-        """
         if key not in _REDRAW_TRIGGER_KEYS:
             return
         self._force_redraw = True
@@ -469,12 +453,6 @@ class OcrOverlayWindow:
             pass
 
     def _poll_cursor_over_blocks(self):
-        """Скрывает блоки, над которыми сейчас курсор, показывает ушедшие.
-
-        Работает через canvas-теги: каждому блоку присвоен tag "blk_{idx}",
-        и прямоугольник фона, и текст имеют этот tag. itemconfigure
-        применяет state='hidden'/'normal' ко всем элементам с этим тегом.
-        """
         if not self._block_tags:
             if self._hidden_block_tags:
                 self._hidden_block_tags = set()
@@ -535,7 +513,6 @@ class OcrOverlayWindow:
         return (fw, fh)
 
     def _refresh(self):
-        # Читаем и сбрасываем флаг принудительной перерисовки.
         force = self._force_redraw
         self._force_redraw = False
 
@@ -581,17 +558,7 @@ class OcrOverlayWindow:
 
         self._empty_frame_streak = 0
 
-        prev_stable_count = len(self._stable_blocks)
         self._stabilize_blocks(blocks)
-
-        if prev_stable_count > 0 and len(self._stable_blocks) == 0:
-            dbg.log_event("pc.overlay_scene_changed",
-                          {"new_blocks": len(blocks)})
-            self._last_fingerprint = None
-            self.canvas.delete("all")
-            self._block_tags = {}
-            self._hidden_block_tags = set()
-            self._stabilize_blocks(blocks)
 
         self._stable_blocks = _deduplicate_by_text(self._stable_blocks)
         self._stable_blocks = _deduplicate_blocks(self._stable_blocks)
@@ -685,7 +652,16 @@ class OcrOverlayWindow:
                 sb['confidence'] = nb_conf
                 sb['pending_text'] = ''
                 sb['pending_count'] = 0
-                self._smooth_block_geometry(sb, nb)
+
+                if sb.get('bbox_settled', True):
+                    self._smooth_block_geometry(sb, nb)
+                else:
+                    counter = sb.get('bbox_settle_counter', 0) + 1
+                    sb['bbox_settle_counter'] = counter
+                    if counter >= BBOX_SETTLE_FRAMES:
+                        sb['bbox_settled'] = True
+                        self._smooth_block_geometry(sb, nb)
+
                 new_stable.append(sb)
                 continue
 
@@ -703,16 +679,12 @@ class OcrOverlayWindow:
                 sb['confidence'] = nb_conf
                 sb['pending_text'] = ''
                 sb['pending_count'] = 0
-                self._smooth_block_geometry(sb, nb)
-                sb['initial_x'] = nb.get('initial_x', nb.get('x', 0))
-                sb['initial_y'] = nb.get('initial_y', nb.get('y', 0))
-                sb['initial_w'] = nb.get('initial_w', nb.get('w', 0))
-                sb['initial_h'] = nb.get('initial_h', nb.get('h', 0))
+                sb['bbox_settled'] = False
+                sb['bbox_settle_counter'] = 0
             else:
                 sb['confidence'] = nb_conf
                 sb['pending_text'] = pending_text
                 sb['pending_count'] = pending_count
-                self._smooth_block_geometry(sb, nb)
 
             new_stable.append(sb)
 
@@ -740,6 +712,8 @@ class OcrOverlayWindow:
                 'miss_count': 0,
                 'pending_text': '',
                 'pending_count': 0,
+                'bbox_settled': True,
+                'bbox_settle_counter': 0,
             }
             new_stable.append(sb)
 
@@ -773,6 +747,15 @@ class OcrOverlayWindow:
             if c.isalpha():
                 return True
         return False
+
+    @staticmethod
+    def _is_block_too_small(b: dict) -> bool:
+        """ИЗМЕНЕНО: блок меньше MIN_BLOCK_AREA — не рисуем."""
+        w = b.get('w', 0)
+        h = b.get('h', 0)
+        if w <= 0 or h <= 0:
+            return True
+        return (w * h) < MIN_BLOCK_AREA
 
     def _redraw(self, blocks, frame_w, frame_h, mode, alpha, ocr_padding=0):
         if not self.target_hwnd:
@@ -823,6 +806,21 @@ class OcrOverlayWindow:
         for idx, b in enumerate(blocks):
             text = b.get('text', '')
             if not text or not has_letters(text):
+                continue
+
+            if _is_suspicious_text(text):
+                dbg.log_event("pc.overlay_skip_suspicious", {
+                    "text": text[:80],
+                })
+                continue
+
+            # ИЗМЕНЕНО: не рисуем мелкие блоки.
+            if self._is_block_too_small(b):
+                dbg.log_event("pc.overlay_skip_small", {
+                    "text": text[:60],
+                    "w": b.get('w', 0),
+                    "h": b.get('h', 0),
+                })
                 continue
 
             bw = b.get('w', 0)
@@ -879,6 +877,23 @@ class OcrOverlayWindow:
             pad = 0.0
 
         for b in blocks:
+            text = b.get('text', '')
+
+            if text and _is_suspicious_text(text):
+                dbg.log_event("pc.overlay_skip_suspicious_debug", {
+                    "text": text[:80],
+                })
+                continue
+
+            # ИЗМЕНЕНО: не рисуем мелкие блоки.
+            if self._is_block_too_small(b):
+                dbg.log_event("pc.overlay_skip_small_debug", {
+                    "text": text[:60],
+                    "w": b.get('w', 0),
+                    "h": b.get('h', 0),
+                })
+                continue
+
             bw = b.get('w', 0)
             bh = b.get('h', 0)
             if bw <= 0 or bh <= 0:
@@ -899,7 +914,6 @@ class OcrOverlayWindow:
             create_rect(gx1, gy1, gx2, gy2, outline="#00ff00", width=2)
             create_rect(x1, y1, x2, y2, outline="#ff0000", width=2)
 
-            text = b.get('text', '')
             if text:
                 max_text_w = max(120, int(canvas_w - x1 - 10))
                 max_text_w = min(max_text_w, 600)
@@ -972,7 +986,6 @@ class OcrOverlayWindow:
         return max(SIZE_ROUND_TO, (v // SIZE_ROUND_TO) * SIZE_ROUND_TO)
 
     def _draw_fitted_text_tagged(self, text, x, y, max_w, max_h, tag):
-        """Как _draw_fitted_text, но создаёт текст с указанным tag'ом."""
         max_w = max(1, int(max_w))
         max_h = max(1, int(max_h))
 
