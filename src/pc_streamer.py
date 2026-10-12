@@ -11,8 +11,11 @@
     при уменьшении окна (важно для OCR).
   - capture_window_frame теперь захватывает КЛИЕНТСКУЮ область
     окна (GetClientRect), а не всё окно (GetWindowRect).
-  - УДАЛЕНО: автопереключение окна в безрамочный режим
-    (borderless fullscreen). Теперь стример не трогает стили окна.
+  - УДАЛЕНО: автопереключение окна в безрамочный режим.
+  - НОВОЕ: ENABLE_GRAYSCALE — grayscale перед кодированием JPEG.
+    ML Kit на Android лучше работает с ч/б: выше контраст,
+    меньше шума, быстрее. По тестам (02_grayscale) даёт 19 блоков
+    и avg_conf 0.766 vs 18 блоков и 0.747 у оригинала.
 """
 
 import cv2
@@ -49,6 +52,11 @@ from src import window_utils
 from src.settings_manager import settings_manager
 
 WINDOW_WATCH_INTERVAL = 0.3
+
+# ИЗМЕНЕНО: grayscale перед кодированием JPEG.
+# ML Kit на Android лучше работает с ч/б: выше контраст,
+# меньше шума, быстрее OCR. Отключается установкой False.
+ENABLE_GRAYSCALE = True
 
 
 class WindowStreamer:
@@ -106,7 +114,7 @@ class WindowStreamer:
             return list(self._our_hwnds)
 
     def set_active_hwnd(self, hwnd, title):
-        """ИЗМЕНЕНО: не сбрасываем current_frame_jpeg — клиент видит старый кадр,
+        """Не сбрасываем current_frame_jpeg — клиент видит старый кадр,
         пока новый не будет захвачен."""
         if hwnd == self.hwnd:
             return
@@ -292,7 +300,7 @@ class WindowStreamer:
                 frame = img[:, :, :3].copy()
 
                 frame = frame[offset_y:offset_y + client_h,
-                offset_x:offset_x + client_w]
+                              offset_x:offset_x + client_w]
 
                 h, w = frame.shape[:2]
                 if w > MAX_STREAM_WIDTH:
@@ -396,8 +404,18 @@ class WindowStreamer:
         dbg.log_event("pc.capture_loop_stop")
 
     def encode_loop(self):
+        """ИЗМЕНЕНО: grayscale перед кодированием JPEG.
+
+        ML Kit на Android лучше работает с ч/б: выше контраст,
+        меньше шума, быстрее OCR. По тестам (02_grayscale) даёт
+        19 блоков и avg_conf 0.766 vs 18 блоков и 0.747 у оригинала.
+
+        Флаг ENABLE_GRAYSCALE в начале файла. Отключается = False.
+        """
         print("[PC-Stream] 🖼️ Поток кодирования запущен")
-        dbg.log_event("pc.encode_loop_start", {"quality": JPEG_QUALITY})
+        dbg.log_event("pc.encode_loop_start",
+                      {"quality": JPEG_QUALITY,
+                       "grayscale": ENABLE_GRAYSCALE})
         encode_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
         last_log_time = time.time()
         encode_count = 0
@@ -409,12 +427,27 @@ class WindowStreamer:
                 continue
 
             try:
+                # ИЗМЕНЕНО: grayscale перед кодированием.
+                # ML Kit лучше работает с ч/б.
+                if ENABLE_GRAYSCALE:
+                    try:
+                        frame_for_jpeg = cv2.cvtColor(
+                            frame, cv2.COLOR_BGR2GRAY
+                        )
+                    except Exception as e:
+                        dbg.log_event("pc.grayscale_error",
+                                      {"error": str(e)})
+                        frame_for_jpeg = frame
+                else:
+                    frame_for_jpeg = frame
+
                 with dbg.timer("pc.encode_raw_copy"):
                     with self.frame_lock:
                         self.current_frame_raw = frame.copy()
 
                 with dbg.timer("pc.encode_jpeg"):
-                    ok, jpeg = cv2.imencode('.jpg', frame, encode_params)
+                    ok, jpeg = cv2.imencode('.jpg', frame_for_jpeg,
+                                             encode_params)
 
                 if ok:
                     jpeg_bytes = jpeg.tobytes()
@@ -423,7 +456,8 @@ class WindowStreamer:
                         self.frame_counter += 1
                     encode_count += 1
 
-                    dbg.log_timing("pc.encode_jpeg_size_kb", len(jpeg_bytes) / 1024.0)
+                    dbg.log_timing("pc.encode_jpeg_size_kb",
+                                   len(jpeg_bytes) / 1024.0)
 
                     if time.time() - last_log_time >= 5:
                         fps = encode_count / (time.time() - last_log_time)

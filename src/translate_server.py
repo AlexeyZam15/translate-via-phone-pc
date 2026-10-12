@@ -1,15 +1,25 @@
 # src/translate_server.py
 """HTTP-сервер перевода на CTranslate2 + Opus-MT.
 
-ИЗМЕНЕНО:
-  - HTTPServer → ThreadingHTTPServer. Параллельные запросы
-    не ждут друг друга.
-  - _ct2_lock вокруг CTranslate2 translate_batch — движок
-    не thread-safe, вызовы сериализуются.
-  - log_translate_input(texts) — логирует вход переводчика.
-  - Параметры декодирования из профиля качества.
-  - Прогрев CTranslate2 при старте.
-  - Кэш переводов (dict + Lock, максимум 5000 записей).
+ИЗМЕНЕНО (устранение регрессии с мусорным переводом):
+
+  УБРАН FUZZY-КЭШ полностью. Он закреплял мусорный перевод:
+    первый запрос "Start Chaper" → "Запуск Chaper" попадал в кэш,
+    потом fuzzy-поиск находил "Start Chapter" ~ "Start Chaper"
+    и отдавал мусор "Запуск Chaper" для ПРАВИЛЬНОГО текста
+    "Start Chapter". Это ломало весь перевод.
+
+  Теперь кэш работает ТОЛЬКО по точному совпадению.
+  OCR-шум ("Start Chaper", "Start Chapler") гасится на стороне
+  оверлея через _is_fragment_of_known и _is_suspicious_text.
+
+  Остальное без изменений:
+    - ThreadingHTTPServer.
+    - _ct2_lock вокруг translate_batch.
+    - log_translate_input / log_translate_text.
+    - Параметры из профиля качества.
+    - Прогрев CTranslate2.
+    - Кэш (dict + Lock, максимум 5000 записей).
 """
 
 import json
@@ -164,15 +174,12 @@ def _init_ctranslate2():
                            "inter_threads": INTER_THREADS,
                            "default_profile": profile,
                            "cache_max": CACHE_MAX_SIZE})
-
-            # Прогрев без удержания _ct2_lock (иначе _init и warmup — deadlock).
         except Exception as e:
             print(f"[Translate-Server] ❌ Ошибка загрузки модели: {e}")
             traceback.print_exc()
             dbg.log_event("pc.translate_server_ct2_error", {"error": str(e)})
             return
 
-    # Прогрев вне _ct2_lock, чтобы не блокировать инициализацию.
     _warmup_ctranslate2()
 
 
@@ -225,7 +232,6 @@ def _translate_ct2(texts, source, target):
             tokens = _sp_source.encode(t, out_type=str) + ["</s>"]
             tokenized.append(tokens)
 
-        # CTranslate2 не thread-safe — сериализуем вызовы.
         with _ct2_lock:
             ct_results = _ct2_translator.translate_batch(
                 tokenized,
@@ -345,7 +351,6 @@ class TranslateServer:
                 pass
 
         try:
-            # ИЗМЕНЕНО: ThreadingHTTPServer вместо HTTPServer.
             self.server = ThreadingHTTPServer(('0.0.0.0', port), Handler)
             self.server.daemon_threads = True
             self.server_thread = threading.Thread(

@@ -5,12 +5,10 @@
 
 ИЗМЕНЕНО:
   - DebugReceiver фильтрует частые Android-стадии (_ANDROID_SKIP_STAGES).
-    Расширен список: убраны все частые стадии, которые оставались в логе
-    (ocr_zone_cache_stats, ocr_pass1, pc_ocr_recognize, ocr_total,
-    ocr_refine_blocks_count, pc_ocr_cycle_total, zone_cache_invalidated,
-    invalidate_on_padding, benchmark_ready_check, benchmark.is_ready,
-    benchmark.start/done/http, translator_ready/warmup/prepare/download,
-    mjpeg_start/connect_attempt/stop/reconnect, settings_loaded_from_pc).
+  - В OcrReceiver добавлено диагностическое сравнение множеств текстов
+    нового и предыдущего пакетов: логируются новые тексты (которых
+    не было) и исчезнувшие (которые были, но пропали). Это помогает
+    диагностировать "залипание" старых блоков на оверлее.
   - OCR-блоки пишутся в ocr_text.log (только при изменении содержимого).
 """
 
@@ -27,9 +25,7 @@ from src.config import (
 from src.debug_logger import logger as dbg
 from src.text_logger import log_ocr_text
 
-# ИЗМЕНЕНО: расширен список skip-стадий.
-# Все частые android.* стадии не пишутся в debug_timing.jsonl,
-# чтобы файл не раздувался.
+# Расширенный список skip-стадий.
 _ANDROID_SKIP_STAGES = {
     # MJPEG
     "android.mjpeg_read_body",
@@ -141,6 +137,10 @@ class OcrReceiver:
         self._last_mode_for_fp = None
         self._last_alpha_for_fp = None
 
+        # ИЗМЕНЕНО: множество текстов предыдущего пакета для
+        # диагностики "залипания" старых блоков.
+        self._last_texts_set = set()
+
         self._request_count = 0
         self._accepted_count = 0
         self._skipped_count = 0
@@ -194,6 +194,28 @@ class OcrReceiver:
                                     f"принято {parent._accepted_count})"
                                 )
                         else:
+                            # ИЗМЕНЕНО: диагностика — сравнить множество
+                            # текстов нового пакета с предыдущим.
+                            new_texts = set()
+                            for b in blocks:
+                                t = (b.get('text') or '').strip()
+                                if t:
+                                    new_texts.add(t)
+                            prev_texts = parent._last_texts_set
+                            appeared = new_texts - prev_texts
+                            disappeared = prev_texts - new_texts
+                            if appeared or disappeared:
+                                # Логируем через debug-логгер (попадёт
+                                # в debug_timing.jsonl, если стадия
+                                # не в skip-списке).
+                                dbg.log_event("pc.ocr_texts_diff", {
+                                    "appeared": sorted(list(appeared))[:20],
+                                    "disappeared": sorted(list(disappeared))[:20],
+                                    "total_new": len(new_texts),
+                                    "total_prev": len(prev_texts),
+                                })
+                            parent._last_texts_set = new_texts
+
                             parent._last_fingerprint = fp
                             parent._last_mode_for_fp = mode
                             parent._last_alpha_for_fp = alpha
