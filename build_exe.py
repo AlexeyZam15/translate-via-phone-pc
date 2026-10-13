@@ -7,17 +7,30 @@
 ИЗМЕНЕНО:
   - src.translate_server в hidden-imports.
   - src.settings_manager, src.settings_server в hidden-imports.
+  - src.gui_settings_window, src.gui_help_windows в hidden-imports
+    (после разделения simple_gui.py на 3 файла).
   - ctranslate2 + sentencepiece для HTTP-перевода (офлайн).
   - Модель через --add-data=models;models.
   - googletrans/argostranslate НЕ включены.
   - Копирование app-debug.apk рядом с exe (для установки на Android).
+  - ЗАРАНЕЕ ПРОВЕРЯЕТСЯ ДОСТУП: перед сборкой завершаются
+    запущенные экземпляры translate_via_phone.exe, а также
+    adb.exe, запущенный из dist (иначе WinError 5 при
+    перезаписи adb.exe / удалении dist).
+  - _safe_rmtree: удаляет файлы по одному, при PermissionError
+    переименовывает залоченный файл в *.locked_<ts> и продолжает.
+    В конце выводит список файлов, которые не удалось удалить.
+  - _kill_processes_using_path: через psutil находит процессы,
+    чей exe() или cwd() лежит внутри указанной папки, и завершает их.
 """
 
 import PyInstaller.__main__
 import os
 import sys
 import shutil
+import time
 import warnings
+import subprocess
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -72,16 +85,325 @@ EXCLUDED_MODULES = [
 USE_UPX = True
 UPX_PATH = "upx"
 
+# Имена процессов, которые могут держать файлы в dist.
+# translate_via_phone.exe — наше приложение, запущенное из dist.
+# adb.exe проверяется отдельно (только если запущен из dist).
+PROCESS_NAMES_TO_KILL = [
+    f"{APP_NAME}.exe",
+]
+
+
+# ============================================================
+# ПРОВЕРКА И ОСВОБОЖДЕНИЕ ФАЙЛОВ
+# ============================================================
+
+def _is_process_running(name: str) -> bool:
+    """Проверяет, запущен ли процесс с таким именем."""
+    name_lower = name.lower()
+    try:
+        import psutil
+        for p in psutil.process_iter(['name']):
+            try:
+                pname = (p.info.get('name') or '').lower()
+                if pname == name_lower:
+                    return True
+            except Exception:
+                continue
+        return False
+    except ImportError:
+        pass
+
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {name}", "/NH"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW
+            if sys.platform == "win32" else 0,
+        )
+        if result.returncode == 0 and name_lower in result.stdout.lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _kill_process(name: str) -> int:
+    """Завершает все процессы с таким именем. Возвращает число убитых."""
+    killed = 0
+    name_lower = name.lower()
+
+    try:
+        import psutil
+        for p in psutil.process_iter(['name']):
+            try:
+                pname = (p.info.get('name') or '').lower()
+                if pname == name_lower:
+                    p.kill()
+                    killed += 1
+            except Exception:
+                continue
+        if killed > 0:
+            return killed
+    except ImportError:
+        pass
+
+    try:
+        result = subprocess.run(
+            ["taskkill", "/F", "/IM", name],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW
+            if sys.platform == "win32" else 0,
+        )
+        if result.returncode == 0:
+            killed = 1
+    except Exception:
+        pass
+    return killed
+
+
+def _kill_processes_using_path(path: str) -> int:
+    """Завершает процессы, чей exe() или cwd() лежит внутри path.
+
+    Нужно, чтобы убить adb.exe, запущенный из dist\\translate_via_phone,
+    и любой python.exe с cwd внутри dist.
+
+    Возвращает число убитых процессов. Текущий процесс не трогает.
+    """
+    if not path:
+        return 0
+    abs_path = os.path.abspath(path).lower()
+    if not os.path.isdir(abs_path):
+        return 0
+
+    killed = 0
+    self_pid = os.getpid()
+
+    try:
+        import psutil
+    except ImportError:
+        # Без psutil не можем проверить путь. Пробуем taskkill
+        # по имени adb.exe — но это может убить чужой adb.
+        # Лучше предупредить.
+        print("[Сборка] ⚠️ psutil не установлен — не могу проверить пути "
+              "процессов. Если сборка падает на удалении dist, "
+              "закройте adb.exe вручную (диспетчер задач).")
+        return 0
+
+    for p in psutil.process_iter(['pid', 'name', 'exe', 'cwd']):
+        try:
+            if p.pid == self_pid:
+                continue
+            info = p.info
+            proc_exe = (info.get('exe') or '').lower()
+            proc_cwd = (info.get('cwd') or '').lower()
+
+            in_path = False
+            if proc_exe and proc_exe.startswith(abs_path):
+                in_path = True
+            if proc_cwd and proc_cwd.startswith(abs_path):
+                in_path = True
+
+            if in_path:
+                pname = info.get('name') or '?'
+                print(f"[Сборка] ⚠️ Процесс {pname} (PID {p.pid}) "
+                      f"держит {abs_path}")
+                try:
+                    p.kill()
+                    killed += 1
+                except Exception as e:
+                    print(f"[Сборка] ⚠️ Не удалось завершить "
+                          f"{pname} (PID {p.pid}): {e}")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except Exception:
+            continue
+
+    return killed
+
+
+def _ensure_no_running_instance():
+    """Завершает процессы, которые могут держать файлы в dist.
+
+    Проверяет:
+      - translate_via_phone.exe (наше приложение, запущенное из dist).
+      - Любой процесс с exe()/cwd() внутри dist (в т.ч. adb.exe
+        из dist\\translate_via_phone\\adb.exe).
+    """
+    print("[Сборка] 🔍 Проверка запущенных экземпляров приложения...")
+    any_found = False
+
+    for proc_name in PROCESS_NAMES_TO_KILL:
+        if _is_process_running(proc_name):
+            any_found = True
+            print(f"[Сборка] ⚠️ Найден запущенный процесс: {proc_name}")
+            killed = _kill_process(proc_name)
+            if killed > 0:
+                print(f"[Сборка] ✅ Завершено процессов: {killed}")
+            else:
+                print(f"[Сборка] ❌ Не удалось завершить {proc_name}. "
+                      f"Закройте приложение вручную и повторите сборку.")
+                sys.exit(1)
+
+    # Убить процессы, чей exe/cwd внутри dist (adb.exe из dist и т.п.)
+    killed_by_path = _kill_processes_using_path(OUTPUT_DIR)
+    if killed_by_path > 0:
+        any_found = True
+        print(f"[Сборка] ✅ Завершено процессов по пути: {killed_by_path}")
+
+    if any_found:
+        time.sleep(1.0)
+    else:
+        print("[Сборка] ✅ Запущенных экземпляров не найдено.")
+
+
+def _check_write_access(path: str) -> bool:
+    """Проверяет, можно ли писать в файл или папку."""
+    try:
+        if os.path.isdir(path):
+            test_file = os.path.join(path, ".write_test_tmp")
+            with open(test_file, "w"):
+                pass
+            try:
+                os.remove(test_file)
+            except Exception:
+                pass
+            return True
+        else:
+            if not os.path.exists(path):
+                parent = os.path.dirname(path) or "."
+                return _check_write_access(parent)
+            with open(path, "a"):
+                pass
+            return True
+    except PermissionError:
+        return False
+    except Exception:
+        return False
+
+
+def _try_remove_file(path: str, locked_list: list) -> bool:
+    """Пытается удалить один файл.
+
+    При PermissionError пробует переименовать в *.locked_<ts>.
+    Если и это не удалось — добавляет путь в locked_list.
+    Возвращает True, если файл удалён или переименован.
+    """
+    try:
+        os.remove(path)
+        return True
+    except PermissionError:
+        pass
+    except FileNotFoundError:
+        return True
+    except Exception as e:
+        print(f"[Сборка] ⚠️ Не удалось удалить {path}: {e}")
+
+    # Пробуем переименовать — часто работает, даже если файл залочен.
+    try:
+        ts = int(time.time())
+        renamed = f"{path}.locked_{ts}"
+        os.rename(path, renamed)
+        print(f"[Сборка] ⚠️ Файл залочен, переименован: "
+              f"{os.path.basename(path)} → {os.path.basename(renamed)}")
+        # Пытаемся удалить переименованный файл (может уже не быть залочен).
+        try:
+            os.remove(renamed)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        print(f"[Сборка] ⚠️ Не удалось переименовать {path}: {e}")
+
+    locked_list.append(path)
+    return False
+
+
+def _safe_rmtree(folder: str) -> bool:
+    """Удаляет папку. Сначала пытается shutil.rmtree, при неудаче —
+    удаляет файлы по одному (с переименованием залоченных).
+
+    Возвращает True, если папка удалена полностью.
+    """
+    if not os.path.exists(folder):
+        return True
+
+    # Быстрый путь: rmtree.
+    try:
+        shutil.rmtree(folder)
+        print(f"🗑️  Удалена папка: {folder}")
+        return True
+    except PermissionError:
+        pass
+    except Exception as e:
+        print(f"⚠️  Не удалось удалить {folder}: {e}")
+
+    # Медленный путь: сначала завершаем процессы, потом удаляем по файлам.
+    print(f"⚠️  Папка {folder} занята, освобождаю...")
+    _ensure_no_running_instance()
+    time.sleep(0.5)
+
+    try:
+        shutil.rmtree(folder)
+        print(f"🗑️  Удалена папка: {folder}")
+        return True
+    except PermissionError:
+        pass
+    except Exception as e:
+        print(f"⚠️  Повторное удаление {folder} не удалось: {e}")
+
+    # Удаляем по файлам.
+    locked_files = []
+    for root, dirs, files in os.walk(folder, topdown=False):
+        for name in files:
+            _try_remove_file(os.path.join(root, name), locked_files)
+        for name in dirs:
+            d = os.path.join(root, name)
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+
+    # Последняя попытка удалить корень.
+    try:
+        os.rmdir(folder)
+        print(f"🗑️  Удалена папка: {folder}")
+        return True
+    except OSError:
+        pass
+
+    if locked_files:
+        print(f"❌ Не удалось удалить {len(locked_files)} файл(ов) "
+              f"в {folder}:")
+        for f in locked_files[:20]:
+            print(f"   • {f}")
+        if len(locked_files) > 20:
+            print(f"   ... и ещё {len(locked_files) - 20}")
+        print("   Закройте процессы, которые держат эти файлы "
+              "(например, adb.exe из dist), и повторите сборку.")
+        return False
+
+    # Файлы удалились, но корень остался (например, .locked_* файлы).
+    if os.path.exists(folder):
+        try:
+            shutil.rmtree(folder, ignore_errors=True)
+        except Exception:
+            pass
+
+    if os.path.exists(folder):
+        print(f"❌ Папка {folder} всё ещё существует.")
+        return False
+
+    print(f"🗑️  Удалена папка: {folder}")
+    return True
+
 
 def clean_old_build():
-    if CLEAN_BEFORE_BUILD:
-        for folder in [OUTPUT_DIR, BUILD_DIR]:
-            if os.path.exists(folder):
-                try:
-                    shutil.rmtree(folder)
-                    print(f"🗑️  Удалена папка: {folder}")
-                except Exception as e:
-                    print(f"⚠️  Не удалось удалить {folder}: {e}")
+    if not CLEAN_BEFORE_BUILD:
+        return
+    for folder in [OUTPUT_DIR, BUILD_DIR]:
+        if os.path.exists(folder):
+            if not _safe_rmtree(folder):
+                sys.exit(1)
 
 
 def _find_apk() -> str:
@@ -98,6 +420,8 @@ def build_exe():
     print("=" * 60)
     print(f"🚀 СБОРКА {APP_NAME}")
     print("=" * 60)
+
+    _ensure_no_running_instance()
 
     args = [
         MAIN_SCRIPT,
@@ -210,6 +534,8 @@ def build_exe():
         '--hidden-import=src.ocr_receiver',
         '--hidden-import=src.ocr_overlay',
         '--hidden-import=src.simple_gui',
+        '--hidden-import=src.gui_settings_window',
+        '--hidden-import=src.gui_help_windows',
         '--hidden-import=src.window_utils',
         '--hidden-import=src.translate_server',
         '--hidden-import=src.settings_manager',
@@ -238,8 +564,6 @@ def build_exe():
     else:
         print("⚠️  Папка models/ не найдена — HTTP-перевод не будет работать в exe")
 
-    # ИЗМЕНЕНО: копируем APK в папку сборки через --add-data.
-    # PyInstaller кладёт файл рядом с exe в onedir-режиме.
     apk_path = _find_apk()
     if apk_path:
         args.append(f'--add-data={apk_path};.')
@@ -289,30 +613,46 @@ def copy_external_tools():
 
     print("\n📦 Копирование внешних утилит...")
 
-    # adb.exe
     adb_src = shutil.which("adb.exe")
     if not adb_src and os.path.exists("adb.exe"):
         adb_src = "adb.exe"
 
     if adb_src:
+        dst = os.path.join(output_app_dir, "adb.exe")
+        if not _check_write_access(dst):
+            print(f"   ⚠️  {dst} занят, освобождаю...")
+            _ensure_no_running_instance()
+            time.sleep(0.5)
+        if not _check_write_access(dst):
+            print(f"   ❌ Нет доступа к {dst}. "
+                  f"Закройте приложение и повторите сборку.")
+            sys.exit(1)
         try:
-            shutil.copy2(adb_src, os.path.join(output_app_dir, "adb.exe"))
+            shutil.copy2(adb_src, dst)
             print(f"   ✅ adb.exe ← {adb_src}")
         except Exception as e:
-            print(f"   ⚠️  Не удалось скопировать adb.exe: {e}")
+            print(f"   ❌ Не удалось скопировать adb.exe: {e}")
+            sys.exit(1)
     else:
         print("   ⚠️  adb.exe не найден (ни рядом, ни в PATH).")
 
-    # APK — страховка, если --add-data не сработал
     apk_src = _find_apk()
     if apk_src:
         dst = os.path.join(output_app_dir, os.path.basename(apk_src))
         if not os.path.exists(dst):
+            if not _check_write_access(dst):
+                print(f"   ⚠️  {dst} занят, освобождаю...")
+                _ensure_no_running_instance()
+                time.sleep(0.5)
+            if not _check_write_access(dst):
+                print(f"   ❌ Нет доступа к {dst}.")
+                sys.exit(1)
             try:
                 shutil.copy2(apk_src, dst)
                 print(f"   ✅ {os.path.basename(apk_src)} ← {apk_src}")
             except Exception as e:
-                print(f"   ⚠️  Не удалось скопировать APK: {e}")
+                print(f"   ❌ Не удалось скопировать APK: {e}")
+                sys.exit(1)
         else:
             print(f"   ✅ APK уже на месте: {os.path.basename(apk_src)}")
     else:
@@ -353,6 +693,8 @@ if __name__ == "__main__":
     if not os.path.isdir("src"):
         print("❌ Не найдена папка src/")
         sys.exit(1)
+
+    _ensure_no_running_instance()
 
     clean_old_build()
     build_exe()
